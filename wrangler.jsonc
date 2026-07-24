@@ -13,19 +13,5 @@
     "traces": {
       "enabled": true
     }
-  },
-  // KV namespace ID is resolved at deploy time by scripts/resolve-bindings.sh
-  "kv_namespaces": [
-    {
-      "binding": "SLUG_KV",
-      "id": "SLUG_KV"
-    }
-  ],
-  "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "cunlink-db",
-      "migrations_dir": "migrations"
-    }
-  ]
+  }
 }
