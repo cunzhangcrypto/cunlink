@@ -28,21 +28,28 @@ Lightweight, fast, fully under your control. Shorten long URLs with one click an
 
 ## Quick Deploy
 
-### One-click
+### Via Cloudflare Git Integration (Recommended)
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/)
+1. **Fork this repo** to your GitHub
 
-### Manual
+2. **Cloudflare Dashboard** → **Workers & Pages** → **Create** → **Pages** → **Connect to Git**, select your fork
 
-```bash
-git clone https://github.com/cunzhang/cunlink
-cd cunlink
-yarn install
-npx wrangler login
-npx wrangler d1 create cunlink-db
-npx wrangler deploy
-npx wrangler d1 migrations apply DB --remote
-```
+3. Set framework to **None**, leave build command empty, click **Begin Deploy**
+
+4. After deployment, go to **Workers & Pages** → **D1** → **Create database**, name it anything
+
+5. Go to **Workers & Pages** → **KV** → **Create namespace**, name it anything
+
+6. Back in your Worker → **Settings** → **Bindings** → **Add binding**:
+
+   | Type | Variable Name | Select |
+   |---|---|---|
+   | D1 Database | `DB` | Your newly created D1 database |
+   | KV Namespace | `SLUG_KV` | Your newly created KV namespace |
+
+7. Go to your Worker's **D1** tab → click your database → **Console**, open [`migrations/0000_full_schema.sql`](migrations/0000_full_schema.sql) from the repo, **copy and paste the entire content** into the console and run it
+
+8. Refresh the page and you're done
 
 ### Local Development
 

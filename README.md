@@ -28,21 +28,28 @@
 
 ## 快速部署
 
-### 一键部署
+### 通过 Cloudflare Git 集成部署（推荐）
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/)
+1. **Fork 仓库** 到你的 GitHub
 
-### 手动部署
+2. **Cloudflare Dashboard** → **Workers & Pages** → **创建** → **Pages** → **连接到 Git**，选择你的 fork
 
-```bash
-git clone https://github.com/cunzhang/cunlink
-cd cunlink
-yarn install
-npx wrangler login
-npx wrangler d1 create cunlink-db
-npx wrangler deploy
-npx wrangler d1 migrations apply DB --remote
-```
+3. 框架选 **无**，构建命令留空，点击 **开始部署**
+
+4. 部署成功后，去 **Workers & Pages** → **D1** → **创建数据库**，名字随意
+
+5. 去 **Workers & Pages** → **KV** → **创建命名空间**，名字随意
+
+6. 回到 Worker → **设置** → **绑定** → **添加绑定**：
+
+   | 类型 | 变量名 | 选择 |
+   |---|---|---|
+   | D1 数据库 | `DB` | 选你刚创建的 D1 数据库 |
+   | KV 命名空间 | `SLUG_KV` | 选你刚创建的 KV |
+
+7. 进入 Worker 的 **D1** 标签 → 点击你的数据库 → **控制台**，打开仓库中 [`migrations/0000_full_schema.sql`](migrations/0000_full_schema.sql)，**复制全部内容粘贴执行**（只需运行这一次）
+
+8. 刷新页面即可使用
 
 ### 本地开发
 
