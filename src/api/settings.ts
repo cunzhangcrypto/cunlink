@@ -28,5 +28,9 @@ export async function handleUpdateSettings(request: Request, env: Env, identity:
     return json({ error: "Invalid JSON body" }, 400);
   }
 
-  return fromServiceResult(await updateAppSettings(env, identity, body as any));
+  try {
+    return fromServiceResult(await updateAppSettings(env, identity, body as any));
+  } catch (err) {
+    return json({ error: String(err) }, 500);
+  }
 }

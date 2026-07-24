@@ -5,6 +5,7 @@ dist/
 .DS_Store
 ignore/
 .claude/
+package-lock.json
 
 # Dart / Flutter SDK
 .dart_tool/

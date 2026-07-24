@@ -2,14 +2,21 @@
 # Resolves Cloudflare resource IDs (D1 databases, KV namespaces) from the API
 # and patches wrangler.jsonc with the real values before deploy or migration.
 #
+# Before running this script:
+#   1. Create your D1 database:   wrangler d1 create <your-db-name>
+#   2. Update database_name in wrangler.jsonc to the name you chose
+#   3. Create your KV namespace:  wrangler kv namespace create SLUG_KV
+#   4. Update the KV namespace id in wrangler.jsonc to the returned ID
+#
+# Then run:  bash scripts/resolve-bindings.sh
+#
 # Requires: CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID in environment,
 # or an active `wrangler login` session.
-#
-# Usage: bash scripts/resolve-bindings.sh
 
 set -euo pipefail
 
 CONFIG="wrangler.jsonc"
+PLACEHOLDER_PATTERN="^YOUR_"
 
 # --- D1 database ---
 
@@ -22,7 +29,12 @@ D1_NAME=$(node -e "
   if (d1 && d1.database_name) console.log(d1.database_name);
 " 2>/dev/null || true)
 
-if [ -n "$D1_NAME" ]; then
+if [ -z "$D1_NAME" ]; then
+  echo "D1: no database_name found in config, skipping."
+elif echo "$D1_NAME" | grep -q "$PLACEHOLDER_PATTERN"; then
+  echo "D1: database_name is still a placeholder ('$D1_NAME')."
+  echo "    Update it in $CONFIG to your actual D1 database name, then re-run this script."
+else
   D1_ID=$(npx wrangler d1 list --json 2>/dev/null | node -e "
     let d = '';
     process.stdin.on('data', c => d += c);
@@ -50,38 +62,24 @@ fi
 
 # --- KV namespaces ---
 
-# Parse all KV bindings whose id matches the binding name (placeholder convention)
+# Parse all KV bindings whose id is still a placeholder (id includes "YOUR_")
 KV_BINDINGS=$(node -e "
   const fs = require('fs');
   const src = fs.readFileSync('./$CONFIG', 'utf8').replace(/\/\/[^\n]*/g, '');
   const cfg = JSON.parse(src);
   const kvs = cfg.kv_namespaces || [];
-  kvs.filter(ns => ns.id === ns.binding).forEach(ns => console.log(ns.binding));
+  kvs.filter(ns => /YOUR_/.test(ns.id)).forEach(ns => console.log(ns.binding));
 " 2>/dev/null || true)
 
 if [ -n "$KV_BINDINGS" ]; then
-  KV_LIST=$(npx wrangler kv namespace list 2>/dev/null)
-
+  echo "KV: the following namespaces still have placeholder IDs:"
   for BINDING in $KV_BINDINGS; do
-    KV_ID=$(echo "$KV_LIST" | node -e "
-      let d = '';
-      process.stdin.on('data', c => d += c);
-      process.stdin.on('end', () => {
-        const ns = JSON.parse(d).find(x => x.title === '$BINDING');
-        if (!ns) { console.error('KV namespace not found: $BINDING'); process.exit(1); }
-        console.log(ns.id);
-      });
-    ")
-
-    # Replace the placeholder id with the real one
-    node -e "
-      const fs = require('fs');
-      let src = fs.readFileSync('./$CONFIG', 'utf8');
-      src = src.replace('\"id\": \"$BINDING\"', '\"id\": \"$KV_ID\"');
-      fs.writeFileSync('./$CONFIG', src);
-    "
-    echo "KV: $BINDING -> $KV_ID"
+    echo "    - $BINDING"
   done
+  echo "    Create each namespace with \`wrangler kv namespace create <name>\`"
+  echo "    and update its id in $CONFIG, then re-run this script."
+else
+  echo "KV: all namespace IDs appear to be set."
 fi
 
 echo "Bindings resolved."
