@@ -66,10 +66,11 @@ export class ClickRepository {
     const mode = data.linkMode ?? "link";
     await db
       .prepare(
-        `INSERT INTO clicks (slug, clicked_at, referrer, referrer_host, country, region, city, device_type, os, browser, language, link_mode, channel, utm_source, utm_medium, utm_campaign, utm_term, utm_content, user_agent, is_bot, is_self_referrer, visitor_fp)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO clicks (slug_id, slug, clicked_at, referrer, referrer_host, country, region, city, device_type, os, browser, language, link_mode, channel, utm_source, utm_medium, utm_campaign, utm_term, utm_content, user_agent, is_bot, is_self_referrer, visitor_fp)
+         VALUES ((SELECT id FROM slugs WHERE slug = ?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .bind(
+        slug,
         slug,
         now,
         data.referrer ?? null,
