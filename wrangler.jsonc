@@ -1,8 +1,8 @@
 {
-  "name": "shrtnr",
+  "name": "cunlink",
   "main": "src/index.tsx",
   "assets": { "directory": "public" },
-  "compatibility_date": "2026-04-01", // LOL
+  "compatibility_date": "2026-07-24",
   "compatibility_flags": ["nodejs_compat"],
   "upload_source_maps": true,
   "observability": {
@@ -13,19 +13,5 @@
     "traces": {
       "enabled": true
     }
-  },
-  // KV namespace ID is resolved at deploy time by scripts/resolve-bindings.sh
-  "kv_namespaces": [
-    {
-      "binding": "SLUG_KV",
-      "id": "SLUG_KV"
-    }
-  ],
-  "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "cunlink-db",
-      "migrations_dir": "migrations"
-    }
-  ]
+  }
 }
