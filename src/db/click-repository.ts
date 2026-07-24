@@ -1,0 +1,1776 @@
+// Copyright 2026 Oddbit (https://oddbit.id)
+// SPDX-License-Identifier: Apache-2.0
+
+import { BreakdownPage, BundleStats, BundleStatsPerLink, ClickData, ClickStats, DashboardStats, LinkWithSlugs, TimelineBucket, TimelineData, TimelineRange } from "../types";
+import { LinkRepository } from "./link-repository";
+import { BundleRepository } from "./bundle-repository";
+import { RANGE_SECONDS, computeDelta } from "../services/trends";
+import { ClickFilters, clickFilterSql } from "./filters";
+import type { PaginatedDimension } from "../constants";
+
+export type BreakdownDimension = "country" | "referrer_host" | "device_type" | "os" | "browser" | "link_mode" | "channel";
+
+const VALID_DIMENSIONS = new Set<BreakdownDimension>([
+  "country", "referrer_host", "device_type", "os", "browser", "link_mode", "channel",
+]);
+
+// Column and extra WHERE fragment for each paginated panel. The Sources panel
+// hides app-scheme Referer values, mirroring getStats/getBundleStats.
+const PAGINATED_DIMENSION_SQL: Record<PaginatedDimension, { col: string; filter: string }> = {
+  countries: { col: "country", filter: "" },
+  referrers: { col: "referrer", filter: " AND referrer NOT LIKE 'android-app://%' AND referrer NOT LIKE 'ios-app://%'" },
+  referrer_hosts: { col: "referrer_host", filter: "" },
+};
+
+/**
+ * Run one breakdown page against an already-scoped WHERE clause. The dimension
+ * is whitelisted via PAGINATED_DIMENSION_SQL, so the interpolated column name is
+ * never caller-controlled.
+ */
+async function runBreakdownPage(
+  db: D1Database,
+  where: string,
+  binds: (string | number)[],
+  dimension: PaginatedDimension,
+  offset: number,
+  limit: number,
+): Promise<BreakdownPage> {
+  const spec = PAGINATED_DIMENSION_SQL[dimension];
+  if (!spec) return { items: [], total: 0 };
+  const scoped = `${where} AND ${spec.col} IS NOT NULL${spec.filter}`;
+  const [rows, totalRow] = await Promise.all([
+    db
+      .prepare(
+        `SELECT ${spec.col} as name, COUNT(*) as count FROM clicks WHERE ${scoped}
+         GROUP BY ${spec.col} ORDER BY count DESC, ${spec.col} ASC LIMIT ? OFFSET ?`,
+      )
+      .bind(...binds, limit, offset)
+      .all<{ name: string; count: number }>(),
+    db
+      .prepare(`SELECT COUNT(DISTINCT ${spec.col}) as cnt FROM clicks WHERE ${scoped}`)
+      .bind(...binds)
+      .first<{ cnt: number }>(),
+  ]);
+  return { items: rows.results ?? [], total: totalRow?.cnt ?? 0 };
+}
+
+export type { ClickFilters } from "./filters";
+
+export class ClickRepository {
+  static async record(
+    db: D1Database,
+    slug: string,
+    data: ClickData = {},
+  ): Promise<void> {
+    const now = Math.floor(Date.now() / 1000);
+    const mode = data.linkMode ?? "link";
+    await db
+      .prepare(
+        `INSERT INTO clicks (slug, clicked_at, referrer, referrer_host, country, region, city, device_type, os, browser, language, link_mode, channel, utm_source, utm_medium, utm_campaign, utm_term, utm_content, user_agent, is_bot, is_self_referrer, visitor_fp)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .bind(
+        slug,
+        now,
+        data.referrer ?? null,
+        data.referrerHost ?? null,
+        data.country ?? null,
+        data.region ?? null,
+        data.city ?? null,
+        data.deviceType ?? null,
+        data.os ?? null,
+        data.browser ?? null,
+        data.language ?? null,
+        mode,
+        data.channel ?? null,
+        data.utmSource ?? null,
+        data.utmMedium ?? null,
+        data.utmCampaign ?? null,
+        data.utmTerm ?? null,
+        data.utmContent ?? null,
+        data.userAgent ?? null,
+        data.isBot ?? 0,
+        data.isSelfReferrer ?? 0,
+        data.visitorFp ?? null,
+      )
+      .run();
+  }
+
+  static async getStats(db: D1Database, linkId: number, range?: TimelineRange, filters?: ClickFilters): Promise<ClickStats> {
+    const slugRows = await db
+      .prepare("SELECT slug FROM slugs WHERE link_id = ?")
+      .bind(linkId)
+      .all<{ slug: string }>();
+    const slugs = (slugRows.results ?? []).map((r) => r.slug);
+
+    const empty: ClickStats = {
+      total_clicks: 0,
+      countries: [], referrers: [], referrer_hosts: [], devices: [], os: [], browsers: [],
+      link_modes: [], channels: [], clicks_over_time: [], slug_clicks: [],
+      num_countries: 0, num_referrers: 0, num_referrer_hosts: 0, num_os: 0, num_browsers: 0,
+    };
+    if (slugs.length === 0) return empty;
+
+    const placeholders = slugs.map(() => "?").join(",");
+    let where = `slug IN (${placeholders})`;
+    const binds: (string | number)[] = [...slugs];
+
+    if (range && range !== "all") {
+      const now = Math.floor(Date.now() / 1000);
+      const seconds: Record<string, number> = { "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400, "90d": 90 * 86400, "1y": 365 * 86400 };
+      const sinceTs = now - (seconds[range] ?? 0);
+      where += ` AND clicked_at >= ?`;
+      binds.push(sinceTs);
+    }
+
+    where += clickFilterSql(filters);
+
+    const [
+      totalRow, countries, referrers, referrerHosts, devices, osList, browsers,
+      linkModes, channels, timeline, slugClicks,
+      numCountriesRow, numReferrersRow, numHostsRow, numOsRow, numBrowsersRow,
+    ] = await Promise.all([
+      db.prepare(`SELECT COUNT(*) as cnt FROM clicks WHERE ${where}`).bind(...binds).first<{ cnt: number }>(),
+      db.prepare(`SELECT country as name, COUNT(*) as count FROM clicks WHERE ${where} AND country IS NOT NULL GROUP BY country ORDER BY count DESC, country ASC LIMIT 10`).bind(...binds).all<{ name: string; count: number }>(),
+      // Sources panel: hide app-scheme Referer values like
+      // `android-app://com.linkedin.android/` from the raw-URL breakdown. The
+      // brand attribution lives in the Domains panel via referrer_host; the
+      // raw row stays in the DB for forensics and future re-attribution.
+      db.prepare(`SELECT referrer as name, COUNT(*) as count FROM clicks WHERE ${where} AND referrer IS NOT NULL AND referrer NOT LIKE 'android-app://%' AND referrer NOT LIKE 'ios-app://%' GROUP BY referrer ORDER BY count DESC, referrer ASC LIMIT 10`).bind(...binds).all<{ name: string; count: number }>(),
+      db.prepare(`SELECT referrer_host as name, COUNT(*) as count FROM clicks WHERE ${where} AND referrer_host IS NOT NULL GROUP BY referrer_host ORDER BY count DESC, referrer_host ASC LIMIT 10`).bind(...binds).all<{ name: string; count: number }>(),
+      db.prepare(`SELECT device_type as name, COUNT(*) as count FROM clicks WHERE ${where} AND device_type IS NOT NULL GROUP BY device_type ORDER BY count DESC`).bind(...binds).all<{ name: string; count: number }>(),
+      db.prepare(`SELECT os as name, COUNT(*) as count FROM clicks WHERE ${where} AND os IS NOT NULL GROUP BY os ORDER BY count DESC LIMIT 10`).bind(...binds).all<{ name: string; count: number }>(),
+      db.prepare(`SELECT browser as name, COUNT(*) as count FROM clicks WHERE ${where} AND browser IS NOT NULL GROUP BY browser ORDER BY count DESC LIMIT 10`).bind(...binds).all<{ name: string; count: number }>(),
+      db.prepare(`SELECT link_mode as name, COUNT(*) as count FROM clicks WHERE ${where} GROUP BY link_mode ORDER BY count DESC`).bind(...binds).all<{ name: string; count: number }>(),
+      db.prepare(`SELECT channel as name, COUNT(*) as count FROM clicks WHERE ${where} AND channel IS NOT NULL GROUP BY channel ORDER BY count DESC`).bind(...binds).all<{ name: string; count: number }>(),
+      db.prepare(`SELECT date(clicked_at, 'unixepoch') as date, COUNT(*) as count FROM clicks WHERE ${where} GROUP BY date ORDER BY date DESC LIMIT 30`).bind(...binds).all<{ date: string; count: number }>(),
+      db.prepare(`SELECT slug, COUNT(*) as count FROM clicks WHERE ${where} GROUP BY slug`).bind(...binds).all<{ slug: string; count: number }>(),
+      db.prepare(`SELECT COUNT(DISTINCT country) as cnt FROM clicks WHERE ${where} AND country IS NOT NULL`).bind(...binds).first<{ cnt: number }>(),
+      db.prepare(`SELECT COUNT(DISTINCT referrer) as cnt FROM clicks WHERE ${where} AND referrer IS NOT NULL AND referrer NOT LIKE 'android-app://%' AND referrer NOT LIKE 'ios-app://%'`).bind(...binds).first<{ cnt: number }>(),
+      db.prepare(`SELECT COUNT(DISTINCT referrer_host) as cnt FROM clicks WHERE ${where} AND referrer_host IS NOT NULL`).bind(...binds).first<{ cnt: number }>(),
+      db.prepare(`SELECT COUNT(DISTINCT os) as cnt FROM clicks WHERE ${where} AND os IS NOT NULL`).bind(...binds).first<{ cnt: number }>(),
+      db.prepare(`SELECT COUNT(DISTINCT browser) as cnt FROM clicks WHERE ${where} AND browser IS NOT NULL`).bind(...binds).first<{ cnt: number }>(),
+    ]);
+
+    return {
+      total_clicks: totalRow?.cnt ?? 0,
+      countries: countries.results ?? [],
+      referrers: referrers.results ?? [],
+      referrer_hosts: referrerHosts.results ?? [],
+      devices: devices.results ?? [],
+      os: osList.results ?? [],
+      browsers: browsers.results ?? [],
+      link_modes: linkModes.results ?? [],
+      channels: channels.results ?? [],
+      clicks_over_time: (timeline.results ?? []).reverse(),
+      slug_clicks: slugClicks.results ?? [],
+      num_countries: numCountriesRow?.cnt ?? 0,
+      num_referrers: numReferrersRow?.cnt ?? 0,
+      num_referrer_hosts: numHostsRow?.cnt ?? 0,
+      num_os: numOsRow?.cnt ?? 0,
+      num_browsers: numBrowsersRow?.cnt ?? 0,
+    };
+  }
+
+  static async getTimeline(
+    db: D1Database,
+    linkId: number,
+    range: TimelineRange,
+    now?: number,
+    filters?: ClickFilters,
+  ): Promise<TimelineData> {
+    const ts = now ?? Math.floor(Date.now() / 1000);
+    const slugRows = await db
+      .prepare("SELECT slug FROM slugs WHERE link_id = ?")
+      .bind(linkId)
+      .all<{ slug: string }>();
+    const slugs = (slugRows.results ?? []).map((r) => r.slug);
+
+    const empty: TimelineData = {
+      range,
+      buckets: [],
+      summary: { last_24h: 0, last_7d: 0, last_30d: 0, last_90d: 0, last_1y: 0 },
+    };
+    if (slugs.length === 0) return empty;
+
+    const placeholders = slugs.map(() => "?").join(",");
+    const filterFrag = clickFilterSql(filters);
+    const where = `slug IN (${placeholders})${filterFrag}`;
+
+    // Summary counts
+    const t24h = ts - 86400;
+    const t7d = ts - 7 * 86400;
+    const t30d = ts - 30 * 86400;
+    const t90d = ts - 90 * 86400;
+    const t1y = ts - 365 * 86400;
+    const [last24h, last7d, last30d, last90d, last1y] = await Promise.all([
+      db.prepare(`SELECT COUNT(*) as cnt FROM clicks WHERE ${where} AND clicked_at >= ?`).bind(...slugs, t24h).first<{ cnt: number }>(),
+      db.prepare(`SELECT COUNT(*) as cnt FROM clicks WHERE ${where} AND clicked_at >= ?`).bind(...slugs, t7d).first<{ cnt: number }>(),
+      db.prepare(`SELECT COUNT(*) as cnt FROM clicks WHERE ${where} AND clicked_at >= ?`).bind(...slugs, t30d).first<{ cnt: number }>(),
+      db.prepare(`SELECT COUNT(*) as cnt FROM clicks WHERE ${where} AND clicked_at >= ?`).bind(...slugs, t90d).first<{ cnt: number }>(),
+      db.prepare(`SELECT COUNT(*) as cnt FROM clicks WHERE ${where} AND clicked_at >= ?`).bind(...slugs, t1y).first<{ cnt: number }>(),
+    ]);
+
+    const summary = {
+      last_24h: last24h?.cnt ?? 0,
+      last_7d: last7d?.cnt ?? 0,
+      last_30d: last30d?.cnt ?? 0,
+      last_90d: last90d?.cnt ?? 0,
+      last_1y: last1y?.cnt ?? 0,
+    };
+
+    // Determine bucket SQL expression and time range
+    let bucketExpr: string;
+    let sinceTs: number | null;
+    let allKind: "daily" | "weekly" | "monthly" = "monthly";
+    let allEarliest = ts;
+
+    switch (range) {
+      case "24h":
+        // hourly buckets: "YYYY-MM-DD HH"
+        bucketExpr = "strftime('%Y-%m-%d %H', clicked_at, 'unixepoch')";
+        sinceTs = ts - 86400;
+        break;
+      case "7d":
+        bucketExpr = "date(clicked_at, 'unixepoch')";
+        sinceTs = ts - 7 * 86400;
+        break;
+      case "30d":
+        bucketExpr = "date(clicked_at, 'unixepoch')";
+        sinceTs = ts - 30 * 86400;
+        break;
+      case "90d":
+        bucketExpr = "date(clicked_at, 'unixepoch')";
+        sinceTs = ts - 90 * 86400;
+        break;
+      case "1y":
+        // weekly buckets: use the Monday of each week
+        bucketExpr = "date(clicked_at, 'unixepoch', 'weekday 0', '-6 days')";
+        sinceTs = ts - 365 * 86400;
+        break;
+      case "all": {
+        // Pick granularity based on actual data span
+        const earliestRow = await db
+          .prepare(`SELECT MIN(clicked_at) as t FROM clicks WHERE ${where}`)
+          .bind(...slugs)
+          .first<{ t: number | null }>();
+        allEarliest = earliestRow?.t ?? ts;
+        const spanDays = Math.max(1, Math.floor((ts - allEarliest) / 86400));
+        if (spanDays <= 90) {
+          bucketExpr = "date(clicked_at, 'unixepoch')";
+          allKind = "daily";
+        } else if (spanDays <= 730) {
+          bucketExpr = "date(clicked_at, 'unixepoch', 'weekday 0', '-6 days')";
+          allKind = "weekly";
+        } else {
+          bucketExpr = "strftime('%Y-%m', clicked_at, 'unixepoch')";
+          allKind = "monthly";
+        }
+        sinceTs = null;
+        break;
+      }
+    }
+
+    const timeFilter = sinceTs !== null ? ` AND clicked_at >= ?` : "";
+    const binds = sinceTs !== null ? [...slugs, sinceTs] : [...slugs];
+
+    const rows = await db
+      .prepare(
+        `SELECT ${bucketExpr} as label, COUNT(*) as count
+         FROM clicks WHERE ${where}${timeFilter}
+         GROUP BY label ORDER BY label ASC`,
+      )
+      .bind(...binds)
+      .all<{ label: string; count: number }>();
+
+    const dataMap = new Map((rows.results ?? []).map((r) => [r.label, r.count]));
+
+    const buckets = range === "all"
+      ? fillBucketsAll(dataMap, ts, allEarliest, allKind)
+      : fillBuckets(range, dataMap, ts, sinceTs);
+
+    return { range, buckets, summary };
+  }
+
+  static async getTrendingLinks(
+    db: D1Database,
+    range: TimelineRange,
+    limit: number,
+    filters?: ClickFilters,
+  ): Promise<{ link_id: number; clicks: number; url: string; label: string | null }[]> {
+    let where = "1=1";
+    const binds: number[] = [];
+
+    if (range && range !== "all") {
+      const now = Math.floor(Date.now() / 1000);
+      const seconds: Record<string, number> = { "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400, "90d": 90 * 86400, "1y": 365 * 86400 };
+      where = "c.clicked_at >= ?";
+      binds.push(now - (seconds[range] ?? 0));
+    }
+
+    where += clickFilterSql(filters, "c");
+
+    const rows = await db
+      .prepare(
+        `SELECT s.link_id, COUNT(*) as clicks, l.url, l.label
+         FROM clicks c
+         JOIN slugs s ON s.slug = c.slug
+         JOIN links l ON l.id = s.link_id
+         WHERE ${where}
+         GROUP BY s.link_id
+         ORDER BY clicks DESC
+         LIMIT ?`,
+      )
+      .bind(...binds, limit)
+      .all<{ link_id: number; clicks: number; url: string; label: string | null }>();
+
+    return rows.results ?? [];
+  }
+
+  static async getGlobalBreakdown(
+    db: D1Database,
+    dimension: BreakdownDimension,
+    range: TimelineRange,
+    limit: number,
+    filters?: ClickFilters,
+  ): Promise<{ name: string; count: number }[]> {
+    if (!VALID_DIMENSIONS.has(dimension)) return [];
+
+    let where = `${dimension} IS NOT NULL`;
+    const binds: number[] = [];
+
+    if (range && range !== "all") {
+      const now = Math.floor(Date.now() / 1000);
+      const seconds: Record<string, number> = { "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400, "90d": 90 * 86400, "1y": 365 * 86400 };
+      where += " AND clicked_at >= ?";
+      binds.push(now - (seconds[range] ?? 0));
+    }
+
+    where += clickFilterSql(filters);
+
+    const rows = await db
+      .prepare(
+        `SELECT ${dimension} as name, COUNT(*) as count
+         FROM clicks
+         WHERE ${where}
+         GROUP BY ${dimension}
+         ORDER BY count DESC
+         LIMIT ?`,
+      )
+      .bind(...binds, limit)
+      .all<{ name: string; count: number }>();
+
+    return rows.results ?? [];
+  }
+
+  static async getBreakdownDistinctCount(
+    db: D1Database,
+    dimension: BreakdownDimension,
+    range: TimelineRange,
+    filters?: ClickFilters,
+  ): Promise<number> {
+    if (!VALID_DIMENSIONS.has(dimension)) return 0;
+
+    let where = `${dimension} IS NOT NULL`;
+    const binds: number[] = [];
+
+    if (range && range !== "all") {
+      const now = Math.floor(Date.now() / 1000);
+      const seconds: Record<string, number> = { "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400, "90d": 90 * 86400, "1y": 365 * 86400 };
+      where += " AND clicked_at >= ?";
+      binds.push(now - (seconds[range] ?? 0));
+    }
+
+    where += clickFilterSql(filters);
+
+    const row = await db
+      .prepare(`SELECT COUNT(DISTINCT ${dimension}) as n FROM clicks WHERE ${where}`)
+      .bind(...binds)
+      .first<{ n: number }>();
+
+    return row?.n ?? 0;
+  }
+
+  static async getTotalClicks(
+    db: D1Database,
+    range: TimelineRange,
+    filters?: ClickFilters,
+  ): Promise<number> {
+    let where = "1=1";
+    const binds: number[] = [];
+
+    if (range && range !== "all") {
+      const now = Math.floor(Date.now() / 1000);
+      const seconds: Record<string, number> = { "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400, "90d": 90 * 86400, "1y": 365 * 86400 };
+      where = "clicked_at >= ?";
+      binds.push(now - (seconds[range] ?? 0));
+    }
+
+    where += clickFilterSql(filters);
+
+    const row = await db
+      .prepare(`SELECT COUNT(*) as cnt FROM clicks WHERE ${where}`)
+      .bind(...binds)
+      .first<{ cnt: number }>();
+
+    return row?.cnt ?? 0;
+  }
+
+  static async getLinkBreakdown(
+    db: D1Database,
+    linkId: number,
+    dimension: BreakdownDimension,
+    range: TimelineRange,
+    limit: number,
+    filters?: ClickFilters,
+  ): Promise<{ name: string; count: number }[]> {
+    if (!VALID_DIMENSIONS.has(dimension)) return [];
+
+    const slugRows = await db
+      .prepare("SELECT slug FROM slugs WHERE link_id = ?")
+      .bind(linkId)
+      .all<{ slug: string }>();
+    const slugs = (slugRows.results ?? []).map((r) => r.slug);
+    if (slugs.length === 0) return [];
+
+    const placeholders = slugs.map(() => "?").join(",");
+    let where = `slug IN (${placeholders}) AND ${dimension} IS NOT NULL`;
+    const binds: (string | number)[] = [...slugs];
+
+    if (range && range !== "all") {
+      const now = Math.floor(Date.now() / 1000);
+      const seconds: Record<string, number> = { "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400, "90d": 90 * 86400, "1y": 365 * 86400 };
+      where += " AND clicked_at >= ?";
+      binds.push(now - (seconds[range] ?? 0));
+    }
+
+    where += clickFilterSql(filters);
+
+    const rows = await db
+      .prepare(
+        `SELECT ${dimension} as name, COUNT(*) as count
+         FROM clicks
+         WHERE ${where}
+         GROUP BY ${dimension}
+         ORDER BY count DESC
+         LIMIT ?`,
+      )
+      .bind(...binds, limit)
+      .all<{ name: string; count: number }>();
+
+    return rows.results ?? [];
+  }
+
+  /**
+   * Paginated breakdown for a single panel (countries, sources, domains) that
+   * mirrors the panel semantics on the detail pages: the Sources dimension
+   * hides app-scheme Referer values exactly as getStats does, and `total` is
+   * the full distinct count so the client can size its paginator. Page rows are
+   * returned ordered by count descending, matching page one (the top entries).
+   */
+  static async getLinkBreakdownPage(
+    db: D1Database,
+    linkId: number,
+    dimension: PaginatedDimension,
+    range: TimelineRange | undefined,
+    offset: number,
+    limit: number,
+    filters?: ClickFilters,
+  ): Promise<BreakdownPage> {
+    const slugRows = await db
+      .prepare("SELECT slug FROM slugs WHERE link_id = ?")
+      .bind(linkId)
+      .all<{ slug: string }>();
+    const slugs = (slugRows.results ?? []).map((r) => r.slug);
+    if (slugs.length === 0) return { items: [], total: 0 };
+
+    const placeholders = slugs.map(() => "?").join(",");
+    let where = `slug IN (${placeholders})`;
+    const binds: (string | number)[] = [...slugs];
+    if (range && range !== "all") {
+      where += " AND clicked_at >= ?";
+      binds.push(Math.floor(Date.now() / 1000) - (RANGE_SECONDS[range] ?? 0));
+    }
+    where += clickFilterSql(filters);
+
+    return runBreakdownPage(db, where, binds, dimension, offset, limit);
+  }
+
+  static async getBundleBreakdownPage(
+    db: D1Database,
+    bundleId: number,
+    dimension: PaginatedDimension,
+    range: TimelineRange,
+    offset: number,
+    limit: number,
+    now?: number,
+    filters?: ClickFilters,
+  ): Promise<BreakdownPage> {
+    const slugRows = await db
+      .prepare(
+        `SELECT s.slug as slug FROM bundle_links bl
+         JOIN slugs s ON s.link_id = bl.link_id
+         WHERE bl.bundle_id = ?`,
+      )
+      .bind(bundleId)
+      .all<{ slug: string }>();
+    const slugs = (slugRows.results ?? []).map((r) => r.slug);
+    if (slugs.length === 0) return { items: [], total: 0 };
+
+    const placeholders = slugs.map(() => "?").join(",");
+    let where = `slug IN (${placeholders})`;
+    const binds: (string | number)[] = [...slugs];
+    if (range !== "all") {
+      const ts = now ?? Math.floor(Date.now() / 1000);
+      where += " AND clicked_at >= ?";
+      binds.push(ts - RANGE_SECONDS[range]);
+    }
+    where += clickFilterSql(filters);
+
+    return runBreakdownPage(db, where, binds, dimension, offset, limit);
+  }
+
+  static async compareLinkStats(
+    db: D1Database,
+    linkId: number,
+    range: TimelineRange,
+    filters?: ClickFilters,
+  ): Promise<{ total_clicks: number; top_country: string | null; top_referrer: string | null }> {
+    const slugRows = await db
+      .prepare("SELECT slug FROM slugs WHERE link_id = ?")
+      .bind(linkId)
+      .all<{ slug: string }>();
+    const slugs = (slugRows.results ?? []).map((r) => r.slug);
+
+    if (slugs.length === 0) {
+      return { total_clicks: 0, top_country: null, top_referrer: null };
+    }
+
+    const placeholders = slugs.map(() => "?").join(",");
+    let where = `slug IN (${placeholders})`;
+    const binds: (string | number)[] = [...slugs];
+
+    if (range && range !== "all") {
+      const now = Math.floor(Date.now() / 1000);
+      const seconds: Record<string, number> = { "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400, "90d": 90 * 86400, "1y": 365 * 86400 };
+      where += " AND clicked_at >= ?";
+      binds.push(now - (seconds[range] ?? 0));
+    }
+
+    where += clickFilterSql(filters);
+
+    const [totalRow, topCountry, topReferrer] = await Promise.all([
+      db.prepare(`SELECT COUNT(*) as cnt FROM clicks WHERE ${where}`).bind(...binds).first<{ cnt: number }>(),
+      db.prepare(`SELECT country as name FROM clicks WHERE ${where} AND country IS NOT NULL GROUP BY country ORDER BY COUNT(*) DESC LIMIT 1`).bind(...binds).first<{ name: string }>(),
+      db.prepare(`SELECT referrer_host as name FROM clicks WHERE ${where} AND referrer_host IS NOT NULL GROUP BY referrer_host ORDER BY COUNT(*) DESC LIMIT 1`).bind(...binds).first<{ name: string }>(),
+    ]);
+
+    return {
+      total_clicks: totalRow?.cnt ?? 0,
+      top_country: topCountry?.name ?? null,
+      top_referrer: topReferrer?.name ?? null,
+    };
+  }
+
+  /**
+   * Returns click totals for the current `range` and the equivalent previous window.
+   * Scoped to one link when `linkId` is provided.
+   *
+   * "All time" has no previous window, so `previous` is always 0.
+   */
+  static async getPeriodClicks(
+    db: D1Database,
+    range: TimelineRange,
+    now?: number,
+    linkId?: number,
+    filters?: ClickFilters,
+  ): Promise<{ current: number; previous: number }> {
+    const ts = now ?? Math.floor(Date.now() / 1000);
+    const filterFrag = clickFilterSql(filters);
+
+    let linkFilter = "";
+    const linkBinds: number[] = [];
+    if (linkId !== undefined) {
+      linkFilter = "slug IN (SELECT slug FROM slugs WHERE link_id = ?)";
+      linkBinds.push(linkId);
+    }
+
+    if (range === "all") {
+      const whereParts = [linkFilter].filter(Boolean);
+      let whereClause = whereParts.join(" AND ");
+      whereClause = whereClause ? whereClause + filterFrag : filterFrag.replace(/^ AND /, "");
+      const row = await db
+        .prepare(whereClause ? `SELECT COUNT(*) as cnt FROM clicks WHERE ${whereClause}` : `SELECT COUNT(*) as cnt FROM clicks`)
+        .bind(...linkBinds)
+        .first<{ cnt: number }>();
+      return { current: row?.cnt ?? 0, previous: 0 };
+    }
+
+    const span = RANGE_SECONDS[range];
+    const currStart = ts - span;
+    const prevStart = ts - 2 * span;
+
+    const baseWhere = linkFilter ? `${linkFilter} AND ` : "";
+    const [cur, prev] = await Promise.all([
+      db
+        .prepare(`SELECT COUNT(*) as cnt FROM clicks WHERE ${baseWhere}clicked_at >= ?${filterFrag}`)
+        .bind(...linkBinds, currStart)
+        .first<{ cnt: number }>(),
+      db
+        .prepare(`SELECT COUNT(*) as cnt FROM clicks WHERE ${baseWhere}clicked_at >= ? AND clicked_at < ?${filterFrag}`)
+        .bind(...linkBinds, prevStart, currStart)
+        .first<{ cnt: number }>(),
+    ]);
+    return { current: cur?.cnt ?? 0, previous: prev?.cnt ?? 0 };
+  }
+
+  /**
+   * Returns counts of links created in current and previous windows.
+   * "All time" has no previous window.
+   */
+  static async getLinkCreationPeriods(
+    db: D1Database,
+    range: TimelineRange,
+    now?: number,
+  ): Promise<{ current: number; previous: number; total: number }> {
+    const ts = now ?? Math.floor(Date.now() / 1000);
+    const totalRow = await db
+      .prepare("SELECT COUNT(*) as cnt FROM links")
+      .first<{ cnt: number }>();
+    const total = totalRow?.cnt ?? 0;
+
+    if (range === "all") {
+      return { current: total, previous: 0, total };
+    }
+
+    const span = RANGE_SECONDS[range];
+    const currStart = ts - span;
+    const prevStart = ts - 2 * span;
+
+    const [cur, prev] = await Promise.all([
+      db
+        .prepare("SELECT COUNT(*) as cnt FROM links WHERE created_at >= ?")
+        .bind(currStart)
+        .first<{ cnt: number }>(),
+      db
+        .prepare("SELECT COUNT(*) as cnt FROM links WHERE created_at >= ? AND created_at < ?")
+        .bind(prevStart, currStart)
+        .first<{ cnt: number }>(),
+    ]);
+    return { current: cur?.cnt ?? 0, previous: prev?.cnt ?? 0, total };
+  }
+
+  /**
+   * Returns a fixed-size counts series for the selected range — used to render
+   * sparklines on KPI cards. Buckets are daily for ranges >= 7d, hourly for 24h,
+   * weekly for 1y, and monthly for all.
+   */
+  static async getSparkline(
+    db: D1Database,
+    range: TimelineRange,
+    now?: number,
+    filters?: ClickFilters,
+  ): Promise<number[]> {
+    const ts = now ?? Math.floor(Date.now() / 1000);
+    const spec = getBucketSpec(range, ts);
+    const filterFrag = clickFilterSql(filters);
+    let where = "";
+    const binds: number[] = [];
+    if (spec.since !== null) {
+      where = "WHERE clicked_at >= ?" + filterFrag;
+      binds.push(spec.since);
+    } else if (filterFrag) {
+      where = "WHERE " + filterFrag.replace(/^ AND /, "");
+    }
+
+    const rows = await db
+      .prepare(
+        `SELECT ${spec.bucketExpr("clicked_at")} as label, COUNT(*) as value
+         FROM clicks ${where}
+         GROUP BY label ORDER BY label ASC`,
+      )
+      .bind(...binds)
+      .all<{ label: string; value: number }>();
+
+    return fillSparkline(rows.results ?? [], spec, range, ts);
+  }
+
+  /** Links-created-per-bucket sparkline. */
+  static async getLinksCreatedSparkline(
+    db: D1Database,
+    range: TimelineRange,
+    now?: number,
+  ): Promise<number[]> {
+    const ts = now ?? Math.floor(Date.now() / 1000);
+    const spec = getBucketSpec(range, ts);
+    const where = spec.since !== null ? "WHERE created_at >= ?" : "";
+    const binds = spec.since !== null ? [spec.since] : [];
+
+    const rows = await db
+      .prepare(
+        `SELECT ${spec.bucketExpr("created_at")} as label, COUNT(*) as value
+         FROM links ${where}
+         GROUP BY label ORDER BY label ASC`,
+      )
+      .bind(...binds)
+      .all<{ label: string; value: number }>();
+
+    return fillSparkline(rows.results ?? [], spec, range, ts);
+  }
+
+  /** Distinct-clicked-links-per-bucket sparkline (counts unique link_id per bucket). */
+  static async getClickedLinksSparkline(
+    db: D1Database,
+    range: TimelineRange,
+    now?: number,
+    filters?: ClickFilters,
+  ): Promise<number[]> {
+    const ts = now ?? Math.floor(Date.now() / 1000);
+    const spec = getBucketSpec(range, ts);
+    const filterFrag = clickFilterSql(filters, "c");
+    let where = "";
+    const binds: number[] = [];
+    if (spec.since !== null) {
+      where = "WHERE c.clicked_at >= ?" + filterFrag;
+      binds.push(spec.since);
+    } else if (filterFrag) {
+      where = "WHERE " + filterFrag.replace(/^ AND /, "");
+    }
+
+    const rows = await db
+      .prepare(
+        `SELECT ${spec.bucketExpr("c.clicked_at")} as label, COUNT(DISTINCT s.link_id) as value
+         FROM clicks c JOIN slugs s ON c.slug = s.slug ${where}
+         GROUP BY label ORDER BY label ASC`,
+      )
+      .bind(...binds)
+      .all<{ label: string; value: number }>();
+
+    return fillSparkline(rows.results ?? [], spec, range, ts);
+  }
+
+
+  /**
+   * Bulk-enriches links with delta_pct using two grouped queries regardless
+   * of list size. Safe for the listings page where per-link queries would
+   * exceed D1's subrequest limit.
+   */
+  static async attachLinkDeltasBulk(
+    db: D1Database,
+    links: LinkWithSlugs[],
+    range: TimelineRange,
+    now?: number,
+    filters?: ClickFilters,
+  ): Promise<LinkWithSlugs[]> {
+    if (links.length === 0) return links;
+    if (range === "all") return links;
+
+    const ts = now ?? Math.floor(Date.now() / 1000);
+    const span = RANGE_SECONDS[range];
+    const currStart = ts - span;
+    const prevStart = ts - 2 * span;
+    const filterFrag = clickFilterSql(filters, "c");
+
+    const [curRows, prevRows] = await Promise.all([
+      db
+        .prepare(
+          `SELECT s.link_id as link_id, COUNT(*) as cnt FROM clicks c JOIN slugs s ON c.slug = s.slug WHERE c.clicked_at >= ?${filterFrag} GROUP BY s.link_id`,
+        )
+        .bind(currStart)
+        .all<{ link_id: number; cnt: number }>(),
+      db
+        .prepare(
+          `SELECT s.link_id as link_id, COUNT(*) as cnt FROM clicks c JOIN slugs s ON c.slug = s.slug WHERE c.clicked_at >= ? AND c.clicked_at < ?${filterFrag} GROUP BY s.link_id`,
+        )
+        .bind(prevStart, currStart)
+        .all<{ link_id: number; cnt: number }>(),
+    ]);
+
+    const curMap = new Map((curRows.results ?? []).map((r) => [r.link_id, r.cnt]));
+    const prevMap = new Map((prevRows.results ?? []).map((r) => [r.link_id, r.cnt]));
+
+    return links.map((link) => ({
+      ...link,
+      delta_pct: computeDelta(curMap.get(link.id) ?? 0, prevMap.get(link.id) ?? 0),
+    }));
+  }
+
+  static async getDashboardStats(
+    db: D1Database,
+    range: TimelineRange = "30d",
+    now?: number,
+    filters?: ClickFilters,
+  ): Promise<DashboardStats> {
+    const ts = now ?? Math.floor(Date.now() / 1000);
+    const since = range === "all" ? null : ts - RANGE_SECONDS[range];
+    const filterFrag = clickFilterSql(filters);
+    const filterFragC = clickFilterSql(filters, "c");
+
+    const countryQuery = since !== null
+      ? db.prepare(`SELECT country as name, COUNT(*) as count FROM clicks WHERE country IS NOT NULL AND clicked_at >= ?${filterFrag} GROUP BY country ORDER BY count DESC LIMIT 5`).bind(since)
+      : db.prepare(`SELECT country as name, COUNT(*) as count FROM clicks WHERE country IS NOT NULL${filterFrag} GROUP BY country ORDER BY count DESC LIMIT 5`);
+
+    const referrerQuery = since !== null
+      ? db.prepare(`SELECT referrer_host as name, COUNT(*) as count FROM clicks WHERE referrer_host IS NOT NULL AND clicked_at >= ?${filterFrag} GROUP BY referrer_host ORDER BY count DESC LIMIT 5`).bind(since)
+      : db.prepare(`SELECT referrer_host as name, COUNT(*) as count FROM clicks WHERE referrer_host IS NOT NULL${filterFrag} GROUP BY referrer_host ORDER BY count DESC LIMIT 5`);
+
+    const numReferrersQuery = since !== null
+      ? db.prepare(`SELECT COUNT(DISTINCT referrer_host) as cnt FROM clicks WHERE referrer_host IS NOT NULL AND clicked_at >= ?${filterFrag}`).bind(since)
+      : db.prepare(`SELECT COUNT(DISTINCT referrer_host) as cnt FROM clicks WHERE referrer_host IS NOT NULL${filterFrag}`);
+
+    const topLinksQuery = since !== null
+      ? db.prepare(`SELECT s.link_id as link_id, COUNT(*) as cnt FROM clicks c JOIN slugs s ON c.slug = s.slug WHERE c.clicked_at >= ?${filterFragC} GROUP BY s.link_id ORDER BY cnt DESC LIMIT 5`).bind(since)
+      : db.prepare(`SELECT s.link_id as link_id, COUNT(*) as cnt FROM clicks c JOIN slugs s ON c.slug = s.slug${filterFragC ? " WHERE " + filterFragC.replace(/^ AND /, "") : ""} GROUP BY s.link_id ORDER BY cnt DESC LIMIT 5`);
+
+    const [
+      clicks,
+      linkPeriods,
+      recentLinks,
+      topCountries,
+      topReferrers,
+      numReferrersRow,
+      topLinkRows,
+      spark,
+      sparkLinks,
+      sparkClickedLinks,
+      domainCount,
+      countryCount,
+      clickedLinkCounts,
+    ] = await Promise.all([
+      this.getPeriodClicks(db, range, ts, undefined, filters),
+      this.getLinkCreationPeriods(db, range, ts),
+      LinkRepository.list(db, { filters, sinceTs: since ?? undefined }),
+      countryQuery.all<{ name: string; count: number }>(),
+      referrerQuery.all<{ name: string; count: number }>(),
+      numReferrersQuery.first<{ cnt: number }>(),
+      topLinksQuery.all<{ link_id: number; cnt: number }>(),
+      this.getSparkline(db, range, ts, filters),
+      this.getLinksCreatedSparkline(db, range, ts),
+      this.getClickedLinksSparkline(db, range, ts, filters),
+      this.getDomainCount(db, range, ts),
+      this.getCountryCount(db, range, ts, filters),
+      this.getClickedLinksPeriods(db, range, ts, filters),
+    ]);
+
+    const withDeltas = await this.attachLinkDeltasBulk(db, recentLinks, range, ts, filters);
+    const linkById = new Map(withDeltas.map((l) => [l.id, l]));
+    const topLinks = (topLinkRows.results ?? [])
+      .map((r) => {
+        const base = linkById.get(r.link_id);
+        return base ? { ...base, total_clicks: r.cnt } : null;
+      })
+      .filter((l): l is LinkWithSlugs => l !== null);
+
+    const daySpan = await this.getDaySpan(db, range, ts);
+    const clicksPerDay = daySpan > 0 ? Math.round(clicks.current / daySpan) : 0;
+    const clicksPerDayDelta = range === "all"
+      ? undefined
+      : computeDelta(clicks.current, clicks.previous);
+
+    return {
+      range,
+      total_links: linkPeriods.current,
+      total_clicks: clicks.current,
+      total_clicks_previous: clicks.previous,
+      total_clicks_delta: computeDelta(clicks.current, clicks.previous),
+      new_links_delta: computeDelta(linkPeriods.current, linkPeriods.previous),
+      clicks_per_day: clicksPerDay,
+      clicks_per_day_delta: clicksPerDayDelta,
+      num_domains: domainCount,
+      num_countries: countryCount,
+      clicked_links: clickedLinkCounts.current,
+      clicked_links_delta: computeDelta(clickedLinkCounts.current, clickedLinkCounts.previous),
+      timeline: spark,
+      timeline_links: sparkLinks,
+      timeline_clicked_links: sparkClickedLinks,
+      recent_links: withDeltas.slice(0, 5),
+      top_links: topLinks,
+      top_countries: topCountries.results ?? [],
+      top_referrers: topReferrers.results ?? [],
+      num_referrers: numReferrersRow?.cnt ?? 0,
+    };
+  }
+
+  /**
+   * Returns the number of days covered by the current window.
+   * Fixed for bounded ranges; for "all", spans from the earliest click to now
+   * (minimum 1 to avoid division by zero).
+   */
+  static async getDaySpan(
+    db: D1Database,
+    range: TimelineRange,
+    now?: number,
+  ): Promise<number> {
+    if (range !== "all") return RANGE_SECONDS[range] / 86400;
+    const ts = now ?? Math.floor(Date.now() / 1000);
+    const row = await db
+      .prepare("SELECT MIN(clicked_at) as first FROM clicks")
+      .first<{ first: number | null }>();
+    if (!row?.first) return 1;
+    const days = Math.max(1, Math.ceil((ts - row.first) / 86400));
+    return days;
+  }
+
+  /**
+   * Distinct destination-domain count for links created in the current window;
+   * lifetime when range is "all". Domain extraction happens in JS since SQLite
+   * lacks a native URL parser.
+   */
+  static async getDomainCount(
+    db: D1Database,
+    range: TimelineRange,
+    now?: number,
+  ): Promise<number> {
+    const ts = now ?? Math.floor(Date.now() / 1000);
+
+    if (range === "all") {
+      const rows = await db.prepare("SELECT url FROM links").all<{ url: string }>();
+      return countDistinctHosts(rows.results ?? []);
+    }
+
+    const currStart = ts - RANGE_SECONDS[range];
+    const rows = await db
+      .prepare("SELECT url FROM links WHERE created_at >= ?")
+      .bind(currStart)
+      .all<{ url: string }>();
+    return countDistinctHosts(rows.results ?? []);
+  }
+
+  /**
+   * Distinct-link counts (links that received at least one click) for the
+   * current and previous windows.
+   */
+  static async getClickedLinksPeriods(
+    db: D1Database,
+    range: TimelineRange,
+    now?: number,
+    filters?: ClickFilters,
+  ): Promise<{ current: number; previous: number }> {
+    const ts = now ?? Math.floor(Date.now() / 1000);
+    const filterFrag = clickFilterSql(filters, "c");
+
+    if (range === "all") {
+      const where = filterFrag ? " WHERE " + filterFrag.replace(/^ AND /, "") : "";
+      const row = await db
+        .prepare(`SELECT COUNT(DISTINCT s.link_id) as cnt FROM clicks c JOIN slugs s ON c.slug = s.slug${where}`)
+        .first<{ cnt: number }>();
+      return { current: row?.cnt ?? 0, previous: 0 };
+    }
+
+    const span = RANGE_SECONDS[range];
+    const currStart = ts - span;
+    const prevStart = ts - 2 * span;
+
+    const [cur, prev] = await Promise.all([
+      db
+        .prepare(`SELECT COUNT(DISTINCT s.link_id) as cnt FROM clicks c JOIN slugs s ON c.slug = s.slug WHERE c.clicked_at >= ?${filterFrag}`)
+        .bind(currStart)
+        .first<{ cnt: number }>(),
+      db
+        .prepare(`SELECT COUNT(DISTINCT s.link_id) as cnt FROM clicks c JOIN slugs s ON c.slug = s.slug WHERE c.clicked_at >= ? AND c.clicked_at < ?${filterFrag}`)
+        .bind(prevStart, currStart)
+        .first<{ cnt: number }>(),
+    ]);
+    return { current: cur?.cnt ?? 0, previous: prev?.cnt ?? 0 };
+  }
+
+  /**
+   * Distinct click-origin country count for the current window; lifetime when
+   * range is "all". Null countries are ignored.
+   */
+  static async getCountryCount(
+    db: D1Database,
+    range: TimelineRange,
+    now?: number,
+    filters?: ClickFilters,
+  ): Promise<number> {
+    const ts = now ?? Math.floor(Date.now() / 1000);
+    const filterFrag = clickFilterSql(filters);
+
+    if (range === "all") {
+      const row = await db
+        .prepare(`SELECT COUNT(DISTINCT country) as cnt FROM clicks WHERE country IS NOT NULL${filterFrag}`)
+        .first<{ cnt: number }>();
+      return row?.cnt ?? 0;
+    }
+
+    const currStart = ts - RANGE_SECONDS[range];
+    const row = await db
+      .prepare(`SELECT COUNT(DISTINCT country) as cnt FROM clicks WHERE country IS NOT NULL AND clicked_at >= ?${filterFrag}`)
+      .bind(currStart)
+      .first<{ cnt: number }>();
+    return row?.cnt ?? 0;
+  }
+
+  /**
+   * Combined analytics across every link in a bundle. Mirrors getStats for a
+   * single link: total clicks, per-dimension breakdowns, timeline, and a
+   * per-link contribution table sorted by clicks desc.
+   */
+  static async getBundleStats(
+    db: D1Database,
+    bundleId: number,
+    range: TimelineRange,
+    now?: number,
+    filters?: ClickFilters,
+  ): Promise<BundleStats | null> {
+    const bundle = await BundleRepository.getById(db, bundleId);
+    if (!bundle) return null;
+
+    const ts = now ?? Math.floor(Date.now() / 1000);
+
+    // Resolve member slugs and link metadata in one query.
+    const memberRows = await db
+      .prepare(
+        `SELECT s.slug as slug, s.link_id as link_id, s.is_primary as is_primary,
+                l.label as label, l.url as url
+         FROM bundle_links bl
+         JOIN slugs s ON s.link_id = bl.link_id
+         JOIN links l ON l.id = bl.link_id
+         WHERE bl.bundle_id = ?`,
+      )
+      .bind(bundleId)
+      .all<{ slug: string; link_id: number; is_primary: number; label: string | null; url: string }>();
+
+    const members = memberRows.results ?? [];
+    const slugs = members.map((r) => r.slug);
+    const linkMeta = new Map<number, { label: string | null; url: string; primary_slug: string }>();
+    for (const m of members) {
+      const existing = linkMeta.get(m.link_id);
+      if (!existing || m.is_primary) {
+        linkMeta.set(m.link_id, {
+          label: m.label,
+          url: m.url,
+          primary_slug: m.is_primary || !existing ? m.slug : existing.primary_slug,
+        });
+      }
+    }
+    const linkCount = linkMeta.size;
+
+    const empty: BundleStats = {
+      bundle,
+      link_count: linkCount,
+      total_clicks: 0,
+      clicked_links: 0,
+      countries_reached: 0,
+      timeline: { range, buckets: [], summary: { last_24h: 0, last_7d: 0, last_30d: 0, last_90d: 0, last_1y: 0 } },
+      countries: [],
+      devices: [],
+      os: [],
+      browsers: [],
+      referrers: [],
+      referrer_hosts: [],
+      link_modes: [],
+      per_link: [],
+      num_countries: 0,
+      num_referrers: 0,
+      num_referrer_hosts: 0,
+      num_os: 0,
+      num_browsers: 0,
+    };
+
+    if (slugs.length === 0) return empty;
+
+    const placeholders = slugs.map(() => "?").join(",");
+    let where = `slug IN (${placeholders})`;
+    const binds: (string | number)[] = [...slugs];
+    if (range !== "all") {
+      const sinceTs = ts - RANGE_SECONDS[range];
+      where += " AND clicked_at >= ?";
+      binds.push(sinceTs);
+    }
+    where += clickFilterSql(filters);
+
+    const [
+      totalRow,
+      countries,
+      countriesReachedRow,
+      referrerHosts,
+      referrers,
+      devices,
+      osList,
+      browsers,
+      linkModes,
+      perLinkRows,
+      timeline,
+      period,
+      numReferrersRow,
+      numHostsRow,
+      numOsRow,
+      numBrowsersRow,
+    ] = await Promise.all([
+      db.prepare(`SELECT COUNT(*) as cnt FROM clicks WHERE ${where}`).bind(...binds).first<{ cnt: number }>(),
+      db.prepare(`SELECT country as name, COUNT(*) as count FROM clicks WHERE ${where} AND country IS NOT NULL GROUP BY country ORDER BY count DESC, country ASC LIMIT 10`).bind(...binds).all<{ name: string; count: number }>(),
+      db.prepare(`SELECT COUNT(DISTINCT country) as cnt FROM clicks WHERE ${where} AND country IS NOT NULL`).bind(...binds).first<{ cnt: number }>(),
+      db.prepare(`SELECT referrer_host as name, COUNT(*) as count FROM clicks WHERE ${where} AND referrer_host IS NOT NULL GROUP BY referrer_host ORDER BY count DESC, referrer_host ASC LIMIT 10`).bind(...binds).all<{ name: string; count: number }>(),
+      // Sources panel filter mirrors getStats: hide app-scheme Referer values.
+      db.prepare(`SELECT referrer as name, COUNT(*) as count FROM clicks WHERE ${where} AND referrer IS NOT NULL AND referrer NOT LIKE 'android-app://%' AND referrer NOT LIKE 'ios-app://%' GROUP BY referrer ORDER BY count DESC, referrer ASC LIMIT 10`).bind(...binds).all<{ name: string; count: number }>(),
+      db.prepare(`SELECT device_type as name, COUNT(*) as count FROM clicks WHERE ${where} AND device_type IS NOT NULL GROUP BY device_type ORDER BY count DESC`).bind(...binds).all<{ name: string; count: number }>(),
+      db.prepare(`SELECT os as name, COUNT(*) as count FROM clicks WHERE ${where} AND os IS NOT NULL GROUP BY os ORDER BY count DESC LIMIT 10`).bind(...binds).all<{ name: string; count: number }>(),
+      db.prepare(`SELECT browser as name, COUNT(*) as count FROM clicks WHERE ${where} AND browser IS NOT NULL GROUP BY browser ORDER BY count DESC LIMIT 10`).bind(...binds).all<{ name: string; count: number }>(),
+      db.prepare(`SELECT link_mode as name, COUNT(*) as count FROM clicks WHERE ${where} GROUP BY link_mode ORDER BY count DESC`).bind(...binds).all<{ name: string; count: number }>(),
+      (() => {
+        const filterFragC = clickFilterSql(filters, "c");
+        let perLinkWhere = `c.slug IN (${placeholders})`;
+        if (range !== "all") perLinkWhere += " AND c.clicked_at >= ?";
+        perLinkWhere += filterFragC;
+        return db.prepare(
+          `SELECT s.link_id as link_id, COUNT(*) as cnt
+           FROM clicks c JOIN slugs s ON s.slug = c.slug
+           WHERE ${perLinkWhere}
+           GROUP BY s.link_id
+           ORDER BY cnt DESC`,
+        ).bind(...binds).all<{ link_id: number; cnt: number }>();
+      })(),
+      this.getBundleTimeline(db, slugs, range, ts, filters),
+      this.getBundlePeriodClicks(db, slugs, range, ts, filters),
+      db.prepare(`SELECT COUNT(DISTINCT referrer) as cnt FROM clicks WHERE ${where} AND referrer IS NOT NULL AND referrer NOT LIKE 'android-app://%' AND referrer NOT LIKE 'ios-app://%'`).bind(...binds).first<{ cnt: number }>(),
+      db.prepare(`SELECT COUNT(DISTINCT referrer_host) as cnt FROM clicks WHERE ${where} AND referrer_host IS NOT NULL`).bind(...binds).first<{ cnt: number }>(),
+      db.prepare(`SELECT COUNT(DISTINCT os) as cnt FROM clicks WHERE ${where} AND os IS NOT NULL`).bind(...binds).first<{ cnt: number }>(),
+      db.prepare(`SELECT COUNT(DISTINCT browser) as cnt FROM clicks WHERE ${where} AND browser IS NOT NULL`).bind(...binds).first<{ cnt: number }>(),
+    ]);
+
+    const totalClicks = totalRow?.cnt ?? 0;
+    const deltaPct = range === "all" ? undefined : computeDelta(period.current, period.previous);
+
+    // Attach per-link deltas in two more grouped queries (scoped to bundle slugs).
+    const perLinkDeltas = range === "all"
+      ? new Map<number, number | undefined>()
+      : await this.getBundlePerLinkDeltas(db, slugs, range, ts, filters);
+
+    const perLink: BundleStatsPerLink[] = [];
+    for (const row of perLinkRows.results ?? []) {
+      const meta = linkMeta.get(row.link_id);
+      if (!meta) continue;
+      const entry: BundleStatsPerLink = {
+        link_id: row.link_id,
+        label: meta.label,
+        primary_slug: meta.primary_slug,
+        url: meta.url,
+        click_count: row.cnt,
+        pct_of_bundle: totalClicks > 0 ? Math.round((row.cnt / totalClicks) * 100) : 0,
+      };
+      const delta = perLinkDeltas.get(row.link_id);
+      if (delta !== undefined) entry.delta_pct = delta;
+      perLink.push(entry);
+    }
+
+    // Include zero-click member links at the end so the UI can show them too.
+    const seen = new Set(perLink.map((p) => p.link_id));
+    for (const [link_id, meta] of linkMeta) {
+      if (!seen.has(link_id)) {
+        perLink.push({
+          link_id,
+          label: meta.label,
+          primary_slug: meta.primary_slug,
+          url: meta.url,
+          click_count: 0,
+          pct_of_bundle: 0,
+          delta_pct: perLinkDeltas.get(link_id),
+        });
+      }
+    }
+
+    const countriesList = countries.results ?? [];
+    const countriesTotal = countriesList.reduce((s, c) => s + c.count, 0);
+    const topCountry = countriesList[0]
+      ? { name: countriesList[0].name, pct: countriesTotal > 0 ? Math.round((countriesList[0].count / countriesTotal) * 100) : 0 }
+      : undefined;
+
+    const top = perLink[0] && perLink[0].click_count > 0 ? perLink[0] : undefined;
+
+    return {
+      bundle,
+      link_count: linkCount,
+      total_clicks: totalClicks,
+      delta_pct: deltaPct,
+      clicked_links: perLink.filter((p) => p.click_count > 0).length,
+      top_performer: top
+        ? { slug: top.primary_slug, label: top.label, click_count: top.click_count, pct_of_bundle: top.pct_of_bundle }
+        : undefined,
+      countries_reached: countriesReachedRow?.cnt ?? 0,
+      top_country: topCountry,
+      timeline,
+      countries: countriesList,
+      devices: devices.results ?? [],
+      os: osList.results ?? [],
+      browsers: browsers.results ?? [],
+      referrers: referrers.results ?? [],
+      referrer_hosts: referrerHosts.results ?? [],
+      link_modes: linkModes.results ?? [],
+      per_link: perLink,
+      num_countries: countriesReachedRow?.cnt ?? 0,
+      num_referrers: numReferrersRow?.cnt ?? 0,
+      num_referrer_hosts: numHostsRow?.cnt ?? 0,
+      num_os: numOsRow?.cnt ?? 0,
+      num_browsers: numBrowsersRow?.cnt ?? 0,
+    };
+  }
+
+  /** Timeline (range-bucketed) scoped to an explicit slug list. */
+  private static async getBundleTimeline(
+    db: D1Database,
+    slugs: string[],
+    range: TimelineRange,
+    ts: number,
+    filters?: ClickFilters,
+  ): Promise<TimelineData> {
+    const empty: TimelineData = {
+      range,
+      buckets: [],
+      summary: { last_24h: 0, last_7d: 0, last_30d: 0, last_90d: 0, last_1y: 0 },
+    };
+    if (slugs.length === 0) return empty;
+
+    const placeholders = slugs.map(() => "?").join(",");
+    const where = `slug IN (${placeholders})${clickFilterSql(filters)}`;
+
+    const t24h = ts - 86400;
+    const t7d = ts - 7 * 86400;
+    const t30d = ts - 30 * 86400;
+    const t90d = ts - 90 * 86400;
+    const t1y = ts - 365 * 86400;
+    const [last24h, last7d, last30d, last90d, last1y] = await Promise.all([
+      db.prepare(`SELECT COUNT(*) as cnt FROM clicks WHERE ${where} AND clicked_at >= ?`).bind(...slugs, t24h).first<{ cnt: number }>(),
+      db.prepare(`SELECT COUNT(*) as cnt FROM clicks WHERE ${where} AND clicked_at >= ?`).bind(...slugs, t7d).first<{ cnt: number }>(),
+      db.prepare(`SELECT COUNT(*) as cnt FROM clicks WHERE ${where} AND clicked_at >= ?`).bind(...slugs, t30d).first<{ cnt: number }>(),
+      db.prepare(`SELECT COUNT(*) as cnt FROM clicks WHERE ${where} AND clicked_at >= ?`).bind(...slugs, t90d).first<{ cnt: number }>(),
+      db.prepare(`SELECT COUNT(*) as cnt FROM clicks WHERE ${where} AND clicked_at >= ?`).bind(...slugs, t1y).first<{ cnt: number }>(),
+    ]);
+
+    const summary = {
+      last_24h: last24h?.cnt ?? 0,
+      last_7d: last7d?.cnt ?? 0,
+      last_30d: last30d?.cnt ?? 0,
+      last_90d: last90d?.cnt ?? 0,
+      last_1y: last1y?.cnt ?? 0,
+    };
+
+    let bucketExpr: string;
+    let sinceTs: number | null;
+    let allKind: "daily" | "weekly" | "monthly" = "monthly";
+    let allEarliest = ts;
+
+    switch (range) {
+      case "24h":
+        bucketExpr = "strftime('%Y-%m-%d %H', clicked_at, 'unixepoch')";
+        sinceTs = ts - 86400;
+        break;
+      case "7d":
+        bucketExpr = "date(clicked_at, 'unixepoch')";
+        sinceTs = ts - 7 * 86400;
+        break;
+      case "30d":
+        bucketExpr = "date(clicked_at, 'unixepoch')";
+        sinceTs = ts - 30 * 86400;
+        break;
+      case "90d":
+        bucketExpr = "date(clicked_at, 'unixepoch')";
+        sinceTs = ts - 90 * 86400;
+        break;
+      case "1y":
+        bucketExpr = "date(clicked_at, 'unixepoch', 'weekday 0', '-6 days')";
+        sinceTs = ts - 365 * 86400;
+        break;
+      case "all": {
+        const earliestRow = await db
+          .prepare(`SELECT MIN(clicked_at) as t FROM clicks WHERE ${where}`)
+          .bind(...slugs)
+          .first<{ t: number | null }>();
+        allEarliest = earliestRow?.t ?? ts;
+        const spanDays = Math.max(1, Math.floor((ts - allEarliest) / 86400));
+        if (spanDays <= 90) {
+          bucketExpr = "date(clicked_at, 'unixepoch')";
+          allKind = "daily";
+        } else if (spanDays <= 730) {
+          bucketExpr = "date(clicked_at, 'unixepoch', 'weekday 0', '-6 days')";
+          allKind = "weekly";
+        } else {
+          bucketExpr = "strftime('%Y-%m', clicked_at, 'unixepoch')";
+          allKind = "monthly";
+        }
+        sinceTs = null;
+        break;
+      }
+    }
+
+    const timeFilter = sinceTs !== null ? " AND clicked_at >= ?" : "";
+    const binds = sinceTs !== null ? [...slugs, sinceTs] : [...slugs];
+
+    const rows = await db
+      .prepare(
+        `SELECT ${bucketExpr} as label, COUNT(*) as count
+         FROM clicks WHERE ${where}${timeFilter}
+         GROUP BY label ORDER BY label ASC`,
+      )
+      .bind(...binds)
+      .all<{ label: string; count: number }>();
+
+    const dataMap = new Map((rows.results ?? []).map((r) => [r.label, r.count]));
+    const buckets: TimelineBucket[] = range === "all"
+      ? fillBucketsAll(dataMap, ts, allEarliest, allKind)
+      : fillBuckets(range, dataMap, ts, sinceTs);
+
+    return { range, buckets, summary };
+  }
+
+  /** Current vs previous period click counts scoped to an explicit slug list. */
+  private static async getBundlePeriodClicks(
+    db: D1Database,
+    slugs: string[],
+    range: TimelineRange,
+    ts: number,
+    filters?: ClickFilters,
+  ): Promise<{ current: number; previous: number }> {
+    if (slugs.length === 0) return { current: 0, previous: 0 };
+    const placeholders = slugs.map(() => "?").join(",");
+    const where = `slug IN (${placeholders})${clickFilterSql(filters)}`;
+
+    if (range === "all") {
+      const row = await db
+        .prepare(`SELECT COUNT(*) as cnt FROM clicks WHERE ${where}`)
+        .bind(...slugs)
+        .first<{ cnt: number }>();
+      return { current: row?.cnt ?? 0, previous: 0 };
+    }
+
+    const span = RANGE_SECONDS[range];
+    const currStart = ts - span;
+    const prevStart = ts - 2 * span;
+
+    const [cur, prev] = await Promise.all([
+      db.prepare(`SELECT COUNT(*) as cnt FROM clicks WHERE ${where} AND clicked_at >= ?`).bind(...slugs, currStart).first<{ cnt: number }>(),
+      db.prepare(`SELECT COUNT(*) as cnt FROM clicks WHERE ${where} AND clicked_at >= ? AND clicked_at < ?`).bind(...slugs, prevStart, currStart).first<{ cnt: number }>(),
+    ]);
+    return { current: cur?.cnt ?? 0, previous: prev?.cnt ?? 0 };
+  }
+
+  private static async getBundlePerLinkDeltas(
+    db: D1Database,
+    slugs: string[],
+    range: TimelineRange,
+    ts: number,
+    filters?: ClickFilters,
+  ): Promise<Map<number, number | undefined>> {
+    const out = new Map<number, number | undefined>();
+    if (slugs.length === 0 || range === "all") return out;
+
+    const placeholders = slugs.map(() => "?").join(",");
+    const filterFrag = clickFilterSql(filters, "c");
+    const span = RANGE_SECONDS[range];
+    const currStart = ts - span;
+    const prevStart = ts - 2 * span;
+
+    const [curRows, prevRows] = await Promise.all([
+      db
+        .prepare(
+          `SELECT s.link_id as link_id, COUNT(*) as cnt
+           FROM clicks c JOIN slugs s ON s.slug = c.slug
+           WHERE c.slug IN (${placeholders}) AND c.clicked_at >= ?${filterFrag}
+           GROUP BY s.link_id`,
+        )
+        .bind(...slugs, currStart)
+        .all<{ link_id: number; cnt: number }>(),
+      db
+        .prepare(
+          `SELECT s.link_id as link_id, COUNT(*) as cnt
+           FROM clicks c JOIN slugs s ON s.slug = c.slug
+           WHERE c.slug IN (${placeholders}) AND c.clicked_at >= ? AND c.clicked_at < ?${filterFrag}
+           GROUP BY s.link_id`,
+        )
+        .bind(...slugs, prevStart, currStart)
+        .all<{ link_id: number; cnt: number }>(),
+    ]);
+
+    const curMap = new Map((curRows.results ?? []).map((r) => [r.link_id, r.cnt]));
+    const prevMap = new Map((prevRows.results ?? []).map((r) => [r.link_id, r.cnt]));
+    const ids = new Set<number>([...curMap.keys(), ...prevMap.keys()]);
+    for (const id of ids) {
+      out.set(id, computeDelta(curMap.get(id) ?? 0, prevMap.get(id) ?? 0));
+    }
+    return out;
+  }
+
+  /**
+   * Bulk summary for the bundles listing: totals, delta, sparkline, top 3 links
+   * per bundle. Uses grouped queries to avoid N+1 against D1.
+   */
+  /**
+   * Summary stats for the bundles listing page. Always reports:
+   *  - total_clicks: lifetime sum across every bundle link (no time filter).
+   *  - delta_pct: trend of last 30 days vs the preceding 30 days, to give
+   *    range = "all" has no previous window so delta_pct is undefined.
+   *  - sparkline: bucketed across the selected range. Granularity follows
+   *    getBucketSpec (hourly for 24h, daily for 7d/30d/90d, weekly for 1y,
+   *    adaptive for all).
+   *  - top_links: top 3 member links by click count within the same range.
+   *    With range = "all" this matches the lifetime total used elsewhere on
+   *    the page.
+   */
+  static async getBundleSummariesBulk(
+    db: D1Database,
+    bundleIds: number[],
+    now?: number,
+    filters?: ClickFilters,
+    range: TimelineRange = "all",
+    // Admin bundle cards show how many bundle links saw traffic in the range,
+    // a figure the public API omits. It costs an extra count query, so it is
+    // gated and only populated when the admin page asks for it. (avg/day is
+    // computed in the page via formatAvgPerDay, off the bundle's own
+    // created_at, so it matches the bundle detail page rather than a
+    // dataset-wide day span.)
+    includeCardExtras = false,
+  ): Promise<Map<number, { total_clicks: number; delta_pct?: number; sparkline: number[]; top_links: { slug: string; click_count: number }[]; clicked_links?: number }>> {
+    const out = new Map<number, { total_clicks: number; delta_pct?: number; sparkline: number[]; top_links: { slug: string; click_count: number }[]; clicked_links?: number }>();
+    for (const id of bundleIds) {
+      out.set(id, { total_clicks: 0, sparkline: [], top_links: [] });
+    }
+    if (bundleIds.length === 0) return out;
+
+    const ts = now ?? Math.floor(Date.now() / 1000);
+    const phBundles = bundleIds.map(() => "?").join(",");
+    const sparkSpec = getBucketSpec(range, ts);
+    const filterFrag = clickFilterSql(filters, "c");
+    const rangeSinceTs = range === "all" ? null : ts - RANGE_SECONDS[range];
+    const rangeFilter = rangeSinceTs !== null ? " AND c.clicked_at >= ?" : "";
+    const rangeBinds: number[] = rangeSinceTs !== null ? [rangeSinceTs] : [];
+
+    // Range-scoped totals per bundle.
+    const totalRows = await db
+      .prepare(
+        `SELECT bl.bundle_id as bundle_id, COUNT(*) as cnt
+         FROM clicks c
+         JOIN slugs s ON s.slug = c.slug
+         JOIN bundle_links bl ON bl.link_id = s.link_id
+         WHERE bl.bundle_id IN (${phBundles})${filterFrag}${rangeFilter}
+         GROUP BY bl.bundle_id`,
+      )
+      .bind(...bundleIds, ...rangeBinds)
+      .all<{ bundle_id: number; cnt: number }>();
+    for (const r of totalRows.results ?? []) {
+      out.get(r.bundle_id)!.total_clicks = r.cnt;
+    }
+
+    // Trend: current range vs previous equivalent window. "all" has no previous.
+    if (range !== "all") {
+      const span = RANGE_SECONDS[range];
+      const currStart = ts - span;
+      const prevStart = ts - 2 * span;
+      const [curRows, prevRows] = await Promise.all([
+        db
+          .prepare(
+            `SELECT bl.bundle_id as bundle_id, COUNT(*) as cnt
+             FROM clicks c
+             JOIN slugs s ON s.slug = c.slug
+             JOIN bundle_links bl ON bl.link_id = s.link_id
+             WHERE c.clicked_at >= ? AND bl.bundle_id IN (${phBundles})${filterFrag}
+             GROUP BY bl.bundle_id`,
+          )
+          .bind(currStart, ...bundleIds)
+          .all<{ bundle_id: number; cnt: number }>(),
+        db
+          .prepare(
+            `SELECT bl.bundle_id as bundle_id, COUNT(*) as cnt
+             FROM clicks c
+             JOIN slugs s ON s.slug = c.slug
+             JOIN bundle_links bl ON bl.link_id = s.link_id
+             WHERE c.clicked_at >= ? AND c.clicked_at < ? AND bl.bundle_id IN (${phBundles})${filterFrag}
+             GROUP BY bl.bundle_id`,
+          )
+          .bind(prevStart, currStart, ...bundleIds)
+          .all<{ bundle_id: number; cnt: number }>(),
+      ]);
+      const curMap = new Map((curRows.results ?? []).map((r) => [r.bundle_id, r.cnt]));
+      const prevMap = new Map((prevRows.results ?? []).map((r) => [r.bundle_id, r.cnt]));
+      for (const [bundleId, entry] of out) {
+        entry.delta_pct = computeDelta(curMap.get(bundleId) ?? 0, prevMap.get(bundleId) ?? 0);
+      }
+    }
+
+    // Sparkline bucketed across the selected range.
+    const sparkSinceFilter = sparkSpec.since !== null ? " AND c.clicked_at >= ?" : "";
+    const sparkBinds: unknown[] = sparkSpec.since !== null ? [sparkSpec.since] : [];
+    const sparkRows = await db
+      .prepare(
+        `SELECT bl.bundle_id as bundle_id, ${sparkSpec.bucketExpr("c.clicked_at")} as label, COUNT(*) as value
+         FROM clicks c
+         JOIN slugs s ON s.slug = c.slug
+         JOIN bundle_links bl ON bl.link_id = s.link_id
+         WHERE bl.bundle_id IN (${phBundles})${filterFrag}${sparkSinceFilter}
+         GROUP BY bl.bundle_id, label
+         ORDER BY label ASC`,
+      )
+      .bind(...bundleIds, ...sparkBinds)
+      .all<{ bundle_id: number; label: string; value: number }>();
+    const sparkByBundle = new Map<number, { label: string; value: number }[]>();
+    for (const r of sparkRows.results ?? []) {
+      const arr = sparkByBundle.get(r.bundle_id) ?? [];
+      arr.push({ label: r.label, value: r.value });
+      sparkByBundle.set(r.bundle_id, arr);
+    }
+    for (const [bundleId, entry] of out) {
+      entry.sparkline = fillSparkline(sparkByBundle.get(bundleId) ?? [], sparkSpec, range, ts);
+    }
+
+    // Top 3 links per bundle within the selected range.
+    const topRows = await db
+      .prepare(
+        `WITH per_link AS (
+           SELECT bl.bundle_id as bundle_id, s.link_id as link_id, COUNT(*) as cnt
+           FROM clicks c
+           JOIN slugs s ON s.slug = c.slug
+           JOIN bundle_links bl ON bl.link_id = s.link_id
+           WHERE bl.bundle_id IN (${phBundles})${filterFrag}${rangeFilter}
+           GROUP BY bl.bundle_id, s.link_id
+         ),
+         ranked AS (
+           SELECT bundle_id, link_id, cnt,
+                  ROW_NUMBER() OVER (PARTITION BY bundle_id ORDER BY cnt DESC) as rn
+           FROM per_link
+         )
+         SELECT r.bundle_id as bundle_id, r.cnt as cnt,
+                (SELECT slug FROM slugs WHERE link_id = r.link_id ORDER BY is_primary DESC, created_at ASC LIMIT 1) as primary_slug
+         FROM ranked r
+         WHERE r.rn <= 3
+         ORDER BY r.bundle_id, r.cnt DESC`,
+      )
+      .bind(...bundleIds, ...rangeBinds)
+      .all<{ bundle_id: number; cnt: number; primary_slug: string | null }>();
+    for (const r of topRows.results ?? []) {
+      const entry = out.get(r.bundle_id);
+      if (!entry) continue;
+      // A link without any slug row cannot be represented on the card, skip it.
+      if (!r.primary_slug) continue;
+      entry.top_links.push({ slug: r.primary_slug, click_count: r.cnt });
+    }
+
+    if (includeCardExtras) {
+      // Links with at least one click in the range, per bundle.
+      const trafficRows = await db
+        .prepare(
+          `SELECT bl.bundle_id as bundle_id, COUNT(DISTINCT s.link_id) as cnt
+           FROM clicks c
+           JOIN slugs s ON s.slug = c.slug
+           JOIN bundle_links bl ON bl.link_id = s.link_id
+           WHERE bl.bundle_id IN (${phBundles})${filterFrag}${rangeFilter}
+           GROUP BY bl.bundle_id`,
+        )
+        .bind(...bundleIds, ...rangeBinds)
+        .all<{ bundle_id: number; cnt: number }>();
+      const trafficMap = new Map((trafficRows.results ?? []).map((r) => [r.bundle_id, r.cnt]));
+
+      for (const [bundleId, entry] of out) {
+        entry.clicked_links = trafficMap.get(bundleId) ?? 0;
+      }
+    }
+
+    return out;
+  }
+}
+
+function countDistinctHosts(rows: { url: string }[]): number {
+  const hosts = new Set<string>();
+  for (const r of rows) {
+    try {
+      hosts.add(new URL(r.url).hostname);
+    } catch {
+      // Skip malformed URLs rather than fail the whole stats query.
+    }
+  }
+  return hosts.size;
+}
+
+function pad2(n: number): string {
+  return n < 10 ? `0${n}` : `${n}`;
+}
+
+interface BucketSpec {
+  /** Builds the SQL grouping expression for a given timestamp column. */
+  bucketExpr: (column: string) => string;
+  /** Unix seconds floor; null means unbounded (range === "all"). */
+  since: number | null;
+  /** Number of buckets to emit in the output series. */
+  buckets: number;
+  /** Approximate bucket width; used to walk backwards when zero-filling. */
+  stepSec: number;
+}
+
+function getBucketSpec(range: TimelineRange, ts: number): BucketSpec {
+  switch (range) {
+    case "24h":
+      return {
+        bucketExpr: (c) => `strftime('%Y-%m-%d %H', ${c}, 'unixepoch')`,
+        since: ts - 86400,
+        buckets: 24,
+        stepSec: 3600,
+      };
+    case "7d":
+      return {
+        bucketExpr: (c) => `date(${c}, 'unixepoch')`,
+        since: ts - 7 * 86400,
+        buckets: 7,
+        stepSec: 86400,
+      };
+    case "30d":
+      return {
+        bucketExpr: (c) => `date(${c}, 'unixepoch')`,
+        since: ts - 30 * 86400,
+        buckets: 30,
+        stepSec: 86400,
+      };
+    case "90d":
+      return {
+        bucketExpr: (c) => `date(${c}, 'unixepoch')`,
+        since: ts - 90 * 86400,
+        buckets: 90,
+        stepSec: 86400,
+      };
+    case "1y":
+      return {
+        bucketExpr: (c) => `strftime('%Y-%m', ${c}, 'unixepoch')`,
+        since: ts - 365 * 86400,
+        buckets: 12,
+        stepSec: 30 * 86400,
+      };
+    case "all":
+    default:
+      return {
+        bucketExpr: (c) => `strftime('%Y-%m', ${c}, 'unixepoch')`,
+        since: null,
+        buckets: 12,
+        stepSec: 30 * 86400,
+      };
+  }
+}
+
+function sparkLabelAt(range: TimelineRange, t: number): string {
+  const d = new Date(t * 1000);
+  if (range === "24h") {
+    return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())} ${pad2(d.getUTCHours())}`;
+  }
+  if (range === "1y" || range === "all") {
+    return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}`;
+  }
+  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+}
+
+function fillSparkline(
+  rows: { label: string; value: number }[],
+  spec: BucketSpec,
+  range: TimelineRange,
+  ts: number,
+): number[] {
+  const map = new Map(rows.map((r) => [r.label, r.value]));
+  const out: number[] = [];
+  for (let i = spec.buckets - 1; i >= 0; i--) {
+    const t = ts - i * spec.stepSec;
+    out.push(map.get(sparkLabelAt(range, t)) ?? 0);
+  }
+  return out;
+}
+
+function fillBuckets(
+  range: TimelineRange,
+  dataMap: Map<string, number>,
+  now: number,
+  sinceTs: number | null,
+): TimelineBucket[] {
+  const buckets: TimelineBucket[] = [];
+
+  if (range === "24h") {
+    // 24 hourly buckets
+    for (let i = 23; i >= 0; i--) {
+      const t = now - i * 3600;
+      const d = new Date(t * 1000);
+      const label = `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())} ${pad2(d.getUTCHours())}`;
+      buckets.push({ label, count: dataMap.get(label) ?? 0 });
+    }
+    return buckets;
+  }
+
+  if (range === "7d" || range === "30d" || range === "90d") {
+    const days = range === "7d" ? 7 : range === "30d" ? 30 : 90;
+    for (let i = days - 1; i >= 0; i--) {
+      const t = now - i * 86400;
+      const d = new Date(t * 1000);
+      const label = `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+      buckets.push({ label, count: dataMap.get(label) ?? 0 });
+    }
+    return buckets;
+  }
+
+  if (range === "1y") {
+    // ~52 weekly buckets (Mondays)
+    // Start from the Monday before or on (now - 365 days)
+    const start = new Date((now - 365 * 86400) * 1000);
+    const startDay = start.getUTCDay(); // 0=Sun
+    const mondayOffset = startDay === 0 ? -6 : 1 - startDay;
+    start.setUTCDate(start.getUTCDate() + mondayOffset);
+    const end = new Date(now * 1000);
+    const cursor = new Date(start);
+    while (cursor <= end) {
+      const label = `${cursor.getUTCFullYear()}-${pad2(cursor.getUTCMonth() + 1)}-${pad2(cursor.getUTCDate())}`;
+      buckets.push({ label, count: dataMap.get(label) ?? 0 });
+      cursor.setUTCDate(cursor.getUTCDate() + 7);
+    }
+    return buckets;
+  }
+
+  return buckets;
+}
+
+function fillBucketsAll(
+  dataMap: Map<string, number>,
+  now: number,
+  earliest: number,
+  kind: "daily" | "weekly" | "monthly",
+): TimelineBucket[] {
+  const buckets: TimelineBucket[] = [];
+  if (dataMap.size === 0) return buckets;
+
+  if (kind === "daily") {
+    const start = new Date(earliest * 1000);
+    start.setUTCHours(0, 0, 0, 0);
+    const end = new Date(now * 1000);
+    end.setUTCHours(0, 0, 0, 0);
+    const cursor = new Date(start);
+    while (cursor <= end) {
+      const label = `${cursor.getUTCFullYear()}-${pad2(cursor.getUTCMonth() + 1)}-${pad2(cursor.getUTCDate())}`;
+      buckets.push({ label, count: dataMap.get(label) ?? 0 });
+      cursor.setUTCDate(cursor.getUTCDate() + 1);
+    }
+    return buckets;
+  }
+
+  if (kind === "weekly") {
+    // Weekly buckets (Mondays) from earliest to now
+    const start = new Date(earliest * 1000);
+    const startDay = start.getUTCDay();
+    const mondayOffset = startDay === 0 ? -6 : 1 - startDay;
+    start.setUTCDate(start.getUTCDate() + mondayOffset);
+    start.setUTCHours(0, 0, 0, 0);
+    const end = new Date(now * 1000);
+    const cursor = new Date(start);
+    while (cursor <= end) {
+      const label = `${cursor.getUTCFullYear()}-${pad2(cursor.getUTCMonth() + 1)}-${pad2(cursor.getUTCDate())}`;
+      buckets.push({ label, count: dataMap.get(label) ?? 0 });
+      cursor.setUTCDate(cursor.getUTCDate() + 7);
+    }
+    return buckets;
+  }
+
+  // monthly
+  const keys = [...dataMap.keys()].sort();
+  const firstMonth = keys[0];
+  const nowDate = new Date(now * 1000);
+  const endMonth = `${nowDate.getUTCFullYear()}-${pad2(nowDate.getUTCMonth() + 1)}`;
+  let [y, m] = firstMonth.split("-").map(Number);
+  const [endY, endM] = endMonth.split("-").map(Number);
+  while (y < endY || (y === endY && m <= endM)) {
+    const label = `${y}-${pad2(m)}`;
+    buckets.push({ label, count: dataMap.get(label) ?? 0 });
+    m++;
+    if (m > 12) { m = 1; y++; }
+  }
+  return buckets;
+}

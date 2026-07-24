@@ -1,0 +1,44 @@
+{
+  "name": "@oddbit/shrtnr-browser-extensions",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Chrome and Firefox browser extensions for shrtnr — shorten the active tab into your self-hosted shrtnr deployment.",
+  "license": "Apache-2.0",
+  "homepage": "https://oddb.it/shrtnr-info",
+  "packageManager": "yarn@1.22.22+sha512.a6b2f7906b721bba3d67d4aff083df04dad64c399707841b7acf00f6b133b7ac24255f2652fa22ae3534329dc6180534e98d17432037ff6fd140556e2bb3137e",
+  "engines": {
+    "node": "22"
+  },
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs --target=all",
+    "build:chrome": "node build.mjs --target=chrome",
+    "build:firefox": "node build.mjs --target=firefox",
+    "dev:chrome": "node build.mjs --target=chrome --watch",
+    "dev:firefox": "node build.mjs --target=firefox --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint:firefox": "web-ext lint --source-dir dist/firefox --self-hosted",
+    "package": "node build.mjs --target=all",
+    "clean": "rm -rf dist",
+    "verify-build": "node scripts/verify-build.mjs"
+  },
+  "dependencies": {
+    "@oddbit/shrtnr": "^1.1.0",
+    "preact": "^10.29.3"
+  },
+  "devDependencies": {
+    "@testing-library/preact": "^3.2.4",
+    "@types/chrome": "^0.2.0",
+    "esbuild": "^0.28.1",
+    "happy-dom": "^20.10.6",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9",
+    "web-ext": "^10.4.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/oddbit/shrtnr.git",
+    "directory": "browser-extensions"
+  }
+}

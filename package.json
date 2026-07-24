@@ -1,0 +1,38 @@
+{
+  "name": "cunlink",
+  "version": "1.0.0",
+  "description": "Cunlink - 由 Web3村长 维护的个人短链接系统，基于 Cloudflare Workers + D1",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": "^22.18.0"
+  },
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "bash scripts/resolve-bindings.sh && wrangler deploy",
+    "wrangler-login": "wrangler login",
+    "db:create": "wrangler d1 create shrtnr-db",
+    "db:migrate:local": "wrangler d1 migrations apply DB --local",
+    "db:migrate:remote": "wrangler d1 migrations apply DB --remote",
+    "secret:put": "wrangler secret put",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "emit-spec": "tsx scripts/emit-spec.ts"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.16.20",
+    "@cloudflare/workers-types": "^4.20260628.1",
+    "@vitest/runner": "^4.1.9",
+    "@vitest/snapshot": "^4.1.9",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9",
+    "wrangler": "^4.105.0"
+  },
+  "packageManager": "yarn@1.22.22+sha512.a6b2f7906b721bba3d67d4aff083df04dad64c399707841b7acf00f6b133b7ac24255f2652fa22ae3534329dc6180534e98d17432037ff6fd140556e2bb3137e",
+  "dependencies": {
+    "@hono/zod-openapi": "^1.4.0",
+    "hono": "^4.12.27",
+    "jose": "^6.2.3",
+    "zod": "^4.4.3"
+  }
+}

@@ -1,0 +1,147 @@
+/* Copyright 2026 Oddbit (https://oddbit.id) */
+/* SPDX-License-Identifier: Apache-2.0 */
+
+@import url("../styles/tokens.css");
+@import url("../styles/forms.css");
+@import url("../styles/cta.css");
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 360px;
+  background: var(--color-canvas);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+#root {
+  width: 360px;
+  min-height: 220px;
+}
+
+.popup {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+}
+
+.popup-header {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  border-bottom: 1px solid var(--color-border);
+  padding-bottom: var(--space-3);
+}
+
+.brand-name {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 18px;
+  letter-spacing: 0.02em;
+  color: var(--color-text);
+}
+
+.brand-tagline {
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+.popup-state {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.popup-heading {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 16px;
+  color: var(--color-text);
+}
+
+.popup-body {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: 13px;
+}
+
+.popup-state-loading {
+  align-items: center;
+  justify-content: center;
+  min-height: 140px;
+}
+
+.short-url-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-2);
+  padding: var(--space-3);
+}
+
+.short-url {
+  font-family: var(--font-mono);
+  font-size: 15px;
+  word-break: break-all;
+  color: var(--color-accent);
+  text-decoration: none;
+}
+
+.short-url:hover {
+  text-decoration: underline;
+}
+
+.copied-toast {
+  margin: 0;
+  padding: var(--space-1) var(--space-2);
+  background: var(--color-success);
+  color: var(--color-success-foreground);
+  border-radius: var(--radius-1);
+  font-size: 12px;
+  align-self: flex-start;
+}
+
+.popup-actions {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.qr-container {
+  display: flex;
+  justify-content: center;
+  background: #ffffff;
+  border-radius: var(--radius-2);
+  padding: var(--space-3);
+}
+
+.qr-container svg,
+.qr-container .qr-image {
+  width: 100%;
+  height: auto;
+  max-width: 220px;
+}
+
+.popup-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-top: 1px solid var(--color-border);
+  padding-top: var(--space-3);
+  font-size: 12px;
+}
+
+.popup-state-error .error-message {
+  margin: 0;
+  padding: var(--space-3);
+  background: var(--color-surface);
+  border: 1px solid var(--color-danger);
+  border-radius: var(--radius-2);
+  color: var(--color-text);
+}

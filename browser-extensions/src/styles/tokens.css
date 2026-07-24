@@ -1,0 +1,45 @@
+/* Copyright 2026 Oddbit (https://oddbit.id) */
+/* SPDX-License-Identifier: Apache-2.0 */
+/*
+ * Design tokens shared by popup and options page. Mirrors the oddbit
+ * theme used in the admin app: dark teal canvas, mint accents.
+ */
+
+:root {
+  --color-canvas: #001916;
+  --color-surface: #062824;
+  --color-surface-2: #0b322e;
+  --color-border: #1f4b46;
+  --color-border-strong: #35665f;
+
+  --color-text: #ecfff8;
+  --color-text-muted: #9fc3bc;
+  --color-text-subtle: #6f9790;
+  --color-text-inverse: #09322f;
+
+  --color-accent: #ff7637;
+  --color-accent-hover: #ff9061;
+  --color-accent-active: #e76328;
+  --color-accent-foreground: #ffffff;
+
+  --color-success: #a7e3a1;
+  --color-success-foreground: #09322f;
+  --color-danger: #ef4444;
+  --color-info: #a4e4ff;
+
+  --font-sans:
+    "Manrope", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-display: "Space Grotesk", var(--font-sans);
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  --radius-1: 4px;
+  --radius-2: 8px;
+  --radius-3: 12px;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+}

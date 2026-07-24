@@ -1,0 +1,128 @@
+name: Release browser extension
+
+# Triggered on pushes to main that touch browser-extensions/**. Publishes
+# only when the version string in browser-extensions/package.json changes
+# in the push range; changelog-only edits run the workflow and exit
+# cleanly. The tag-exists check is a second idempotency layer that makes
+# reruns of a successful release a no-op.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'browser-extensions/**'
+      - '.github/workflows/release-extension.yml'
+      - 'scripts/extract-changelog.sh'
+      - 'scripts/read-version.sh'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-extension-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        run: |
+          CURRENT=$(bash scripts/read-version.sh browser-extensions/package.json)
+          TAG="ext-v$CURRENT"
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.sha }}"
+          MANIFEST_CHANGED="unknown"
+          if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            if git diff --name-only "$BEFORE" "$AFTER" -- browser-extensions/package.json | grep -Fxq browser-extensions/package.json; then
+              MANIFEST_CHANGED="true"
+            else
+              MANIFEST_CHANGED="false"
+            fi
+          fi
+          if [ "$MANIFEST_CHANGED" = "false" ]; then
+            echo "manifest browser-extensions/package.json not touched in push $BEFORE..$AFTER; skipping" >&2
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          elif git rev-parse "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "tag $TAG already exists on origin; skipping" >&2
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Extract changelog for version
+        if: steps.version.outputs.should_run == 'true'
+        run: |
+          bash scripts/extract-changelog.sh \
+            "${{ steps.version.outputs.current }}" \
+            browser-extensions/CHANGELOG.md \
+            /tmp/release-notes.md
+
+      - uses: actions/setup-node@v6
+        if: steps.version.outputs.should_run == 'true'
+        with:
+          node-version-file: package.json
+
+      - name: Install + test + build
+        if: steps.version.outputs.should_run == 'true'
+        working-directory: browser-extensions
+        run: |
+          yarn install --frozen-lockfile
+          yarn test
+          yarn build
+          node scripts/verify-build.mjs
+          yarn lint:firefox
+
+      - name: Upload to Chrome Web Store
+        if: steps.version.outputs.should_run == 'true'
+        working-directory: browser-extensions
+        env:
+          CWS_CLIENT_ID: ${{ secrets.CHROME_WEBSTORE_CLIENT_ID }}
+          CWS_CLIENT_SECRET: ${{ secrets.CHROME_WEBSTORE_CLIENT_SECRET }}
+          CWS_REFRESH_TOKEN: ${{ secrets.CHROME_WEBSTORE_REFRESH_TOKEN }}
+          CWS_EXTENSION_ID: ${{ secrets.CHROME_WEBSTORE_EXTENSION_ID }}
+        run: |
+          npx --yes chrome-webstore-upload-cli@3 upload \
+            --source dist/chrome.zip \
+            --extension-id "$CWS_EXTENSION_ID" \
+            --client-id "$CWS_CLIENT_ID" \
+            --client-secret "$CWS_CLIENT_SECRET" \
+            --refresh-token "$CWS_REFRESH_TOKEN" \
+            --auto-publish
+
+      - name: Upload to Firefox Add-ons (AMO)
+        if: steps.version.outputs.should_run == 'true'
+        working-directory: browser-extensions
+        env:
+          WEB_EXT_API_KEY: ${{ secrets.FIREFOX_AMO_API_KEY }}
+          WEB_EXT_API_SECRET: ${{ secrets.FIREFOX_AMO_API_SECRET }}
+        run: |
+          npx --yes web-ext sign \
+            --source-dir dist/firefox \
+            --channel listed \
+            --api-key "$WEB_EXT_API_KEY" \
+            --api-secret "$WEB_EXT_API_SECRET"
+
+      - name: Create and push tag
+        if: steps.version.outputs.should_run == 'true'
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          git tag "$TAG"
+          git push origin "$TAG"
+
+      - name: Create GitHub release
+        if: steps.version.outputs.should_run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --title "${{ steps.version.outputs.tag }}" \
+            --notes-file /tmp/release-notes.md

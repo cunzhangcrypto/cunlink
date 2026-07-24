@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Read version and check tag
+        id: version
+        run: |
+          CURRENT=$(jq -r .version package.json)
+          if [ -z "$CURRENT" ] || [ "$CURRENT" = "null" ]; then
+            echo "Could not read version from package.json" >&2
+            exit 1
+          fi
+          TAG="app-v$CURRENT"
+          if git rev-parse "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Extract changelog for version
+        if: steps.version.outputs.exists == 'false'
+        run: |
+          bash scripts/extract-changelog.sh \
+            "${{ steps.version.outputs.current }}" \
+            CHANGELOG.md \
+            /tmp/release_notes.md
+
+      - name: Create tag and release
+        if: steps.version.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          git tag "$TAG"
+          git push origin "$TAG"
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file /tmp/release_notes.md

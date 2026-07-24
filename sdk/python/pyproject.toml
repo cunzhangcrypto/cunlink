@@ -1,0 +1,106 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "shrtnr"
+version = "1.1.0"
+description = "SDK for the shrtnr URL shortener API"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.10"
+authors = [{ name = "Oddbit", email = "hello@oddbit.id" }]
+keywords = [
+  "url-shortener",
+  "link-shortener",
+  "short-url",
+  "shorten-url",
+  "shrtnr",
+  "cloudflare-workers",
+  "cloudflare-d1",
+  "sdk",
+  "python",
+  "link-management",
+  "click-analytics",
+  "custom-slug",
+]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
+dependencies = [
+  "httpx>=0.28.1",
+]
+
+[project.urls]
+Homepage = "https://oddb.it/shrtnr-website-pypi"
+Repository = "https://github.com/oddbit/shrtnr"
+Changelog = "https://github.com/oddbit/shrtnr/blob/main/sdk/python/CHANGELOG.md"
+Issues = "https://github.com/oddbit/shrtnr/issues"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=9.1.1",
+  "pytest-asyncio>=1.4.0",
+  "respx>=0.23.1",
+  "mypy>=2.1.0",
+  "ruff>=0.15.20",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/shrtnr"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"TRADEMARK_POLICY.md" = "shrtnr/TRADEMARK_POLICY.md"
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "src/shrtnr",
+  "README.md",
+  "CHANGELOG.md",
+  "LICENSE",
+  "NOTICE",
+  "TRADEMARK_POLICY.md",
+  "pyproject.toml",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["shrtnr"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unreachable = true
+
+[tool.shrtnr]
+spec_hash = "sha256:f0ab6f1c4e4ef920e0e6dba67bc8ed80658fb70d6da3364ff97156330d44c2d2"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# Default `pytest` runs unit tests only. E2e tests need a live shrtnr server
+# and are opt-in via `pytest -m e2e` — the scripts/test-sdks-e2e.sh harness
+# spins up wrangler dev, mints an API key, and runs them for real.
+addopts = "-m 'not e2e'"
+markers = [
+  "e2e: end-to-end tests that hit a real wrangler dev server (set SHRTNR_TEST_URL + SHRTNR_TEST_API_KEY)",
+]
