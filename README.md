@@ -47,9 +47,11 @@
    | D1 数据库 | `DB` | 选你刚创建的 D1 数据库 |
    | KV 命名空间 | `SLUG_KV` | 选你刚创建的 KV |
 
-7. 进入 Worker 的 **D1** 标签 → 点击你的数据库 → **控制台**，打开仓库中 [`migrations/0000_full_schema.sql`](migrations/0000_full_schema.sql)，**复制全部内容粘贴执行**（只需运行这一次）
+7. 进入 Worker 的 **D1** 标签 → 点击你的数据库 → **控制台**，打开仓库中 [`migrations/init.sql`](migrations/init.sql)，**按文件中标注的步骤逐条执行**（D1 Console 每次只能执行一条 SQL，请勿一次性粘贴全部内容）
 
 8. 刷新页面即可使用
+
+> 详细操作步骤请参阅 [`说明.md`](说明.md)
 
 ### 本地开发
 
