@@ -28,30 +28,55 @@
 
 ## 快速部署
 
-### 通过 Cloudflare Git 集成部署（推荐）
+> 以下步骤在本地终端操作，需安装 [Node.js](https://nodejs.org/) 和 [Wrangler CLI](https://developers.cloudflare.com/workers/wrangler/)。
 
-1. **Fork 仓库** 到你的 GitHub
+### 1. 准备环境
 
-2. **Cloudflare Dashboard** → **Workers & Pages** → **创建** → **Pages** → **连接到 Git**，选择你的 fork
+```bash
+# 克隆仓库
+git clone https://github.com/你的用户名/cunlink.git
+cd cunlink
 
-3. 框架选 **无**，构建命令留空，点击 **开始部署**
+# 安装依赖
+yarn install
+```
 
-4. 部署成功后，去 **Workers & Pages** → **D1** → **创建数据库**，名字随意
+### 2. 创建数据库和 KV
 
-5. 去 **Workers & Pages** → **KV** → **创建命名空间**，名字随意
+在 Cloudflare Dashboard 操作：
 
-6. 回到 Worker → **设置** → **绑定** → **添加绑定**：
+1. **Workers & Pages** → **D1** → **创建数据库**，名字随意（如 `cunlink-db`）
+2. **Workers & Pages** → **KV** → **创建命名空间**，名字随意（如 `cunlink-kv`）
 
-   | 类型 | 变量名 | 选择 |
-   |---|---|---|
-   | D1 数据库 | `DB` | 选你刚创建的 D1 数据库 |
-   | KV 命名空间 | `SLUG_KV` | 选你刚创建的 KV |
+### 3. 部署 Worker
 
-7. 进入 Worker 的 **D1** 标签 → 点击你的数据库 → **控制台**，打开仓库中 [`migrations/init.sql`](migrations/init.sql)，**按文件中标注的步骤逐条执行**（D1 Console 每次只能执行一条 SQL，请勿一次性粘贴全部内容）
+```bash
+# 首次需要登录（如果没登录过）
+npx wrangler login
 
-8. 刷新页面即可使用
+# 部署
+yarn deploy
+```
 
-> 详细操作步骤请参阅 [`说明.md`](说明.md)
+### 4. 配置绑定
+
+部署成功后，去 Cloudflare Dashboard：
+
+1. **Workers & Pages** → **Workers** 标签 → 点你的 `cunlink` Worker
+2. **设置** → **绑定** → **添加绑定**：
+
+   | 绑定类型 | 变量名 | 选择 |
+   |---------|--------|------|
+   | **D1 数据库** | `DB` | 选你刚创建的 D1 数据库 |
+   | **KV 命名空间** | `SLUG_KV` | 选你刚创建的 KV 命名空间 |
+
+### 5. 初始化数据库
+
+Worker → **D1** 标签 → 点击你的数据库 → **控制台**，打开仓库中 [`migrations/init.sql`](migrations/init.sql)，**按文件中标注的步骤逐条执行**（D1 Console 每次只能执行一条 SQL，请勿一次性粘贴全部内容）
+
+### 6. 完成
+
+所有步骤完成后刷新 Worker 页面即可使用。
 
 ### 本地开发
 
@@ -63,9 +88,7 @@ npx wrangler dev
 
 然后访问 `http://localhost:8787` 即可查看。
 
-### 本地开发免登录
-
-在项目根目录创建 `.dev.vars` 文件：
+本地开发免登录：在项目根目录创建 `.dev.vars` 文件：
 
 ```
 DEV_IDENTITY=dev@local
