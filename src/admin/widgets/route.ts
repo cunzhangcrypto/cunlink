@@ -22,6 +22,7 @@ export function widgetErrorFragment(
   id: string,
   query: string,
   t: TranslateFn,
+  detail?: string,
 ): string {
   // Everything interpolated into this raw() string must be escaped: `query`
   // comes straight from the request URL and `id`/translations flow in too, so
@@ -31,9 +32,11 @@ export function widgetErrorFragment(
   const msg = escHtml(t("widget.error"));
   const retry = escHtml(t("widget.retry"));
   const url = escHtml(`/_/admin/w/${id}${query ? `?${query}` : ""}`);
+  const errDetail = detail ? escHtml(detail.substring(0, 500)) : "";
   return String(
     raw(
       `<div class="widget-error"><p>${msg}</p>` +
+        (errDetail ? `<pre class="widget-error-detail" style="font-size:0.75rem;color:var(--color-text-subtle);white-space:pre-wrap;margin:0.5rem 0;max-height:4rem;overflow:auto">${errDetail}</pre>` : "") +
         `<button type="button" class="btn btn-sm" hx-get="${url}" hx-target="closest .widget-slot" hx-swap="innerHTML">${retry}</button></div>`,
     ),
   );
@@ -72,13 +75,14 @@ export async function handleWidget(c: Context): Promise<Response> {
       body = await fragment();
     }
     return c.html(body);
-  } catch {
+  } catch (err) {
     // Re-fire the exact same hx-get (path + query) so Retry repeats the
     // request that failed. Strip the leading "?" so the fragment owns the
     // delimiter and emits no stray "?" when the request carried no query.
     const query = c.req.url.includes("?")
       ? c.req.url.split("?").slice(1).join("?")
       : "";
-    return c.html(widgetErrorFragment(id, query, ctx.t), 200);
+    const detail = String(err instanceof Error ? err.message : err);
+    return c.html(widgetErrorFragment(id, query, ctx.t, detail), 200);
   }
 }
