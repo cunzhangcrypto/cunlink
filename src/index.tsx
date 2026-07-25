@@ -526,6 +526,12 @@ app.get("/:slug", (c) => {
 
 app.notFound(() => notFoundResponse());
 
+// ---- Global error handler ----
+app.onError((err, c) => {
+  console.error("Unhandled error:", err.message, err.stack);
+  return c.json({ error: err.message, stack: err.stack }, 500);
+});
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     return app.fetch(request, env, ctx);
